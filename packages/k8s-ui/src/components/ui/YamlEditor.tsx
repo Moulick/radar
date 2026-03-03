@@ -1,5 +1,5 @@
 import { useRef, useCallback, useEffect } from 'react'
-import Editor, { OnMount, OnChange } from '@monaco-editor/react'
+import Editor, { OnMount, OnChange, type Monaco } from '@monaco-editor/react'
 import type { editor } from 'monaco-editor'
 
 interface YamlEditorProps {
@@ -90,7 +90,7 @@ export function YamlEditor({
 }: YamlEditorProps) {
   const editorRef = useRef<editor.IStandaloneCodeEditor | null>(null)
   const decorationsRef = useRef<string[]>([])
-  const monacoRef = useRef<typeof import('monaco-editor') | null>(null)
+  const monacoRef = useRef<Monaco | null>(null)
 
   // Apply decorations for editable fields
   const applyDecorations = useCallback(() => {
@@ -165,8 +165,8 @@ export function YamlEditor({
       document.head.appendChild(style)
     }
 
-    // Configure YAML diagnostics
-    monaco.languages.yaml?.yamlDefaults?.setDiagnosticsOptions({
+    // Configure YAML diagnostics (yaml property added by monaco-yaml plugin when available)
+    ;(monaco.languages as any).yaml?.yamlDefaults?.setDiagnosticsOptions({
       enableSchemaRequest: false,
       validate: true,
       format: true,

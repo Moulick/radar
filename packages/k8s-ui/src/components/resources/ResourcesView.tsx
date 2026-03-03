@@ -1366,6 +1366,8 @@ interface ResourcesViewProps {
   locationSearch?: string
   locationPathname?: string
   onNavigate?: (path: string, options?: { replace?: boolean }) => void
+  /** URL prefix for this view (default: '/resources'). Must match the route path. */
+  basePath?: string
   // Dock actions
   onOpenLogs?: (params: { namespace: string; podName: string; containers: string[]; containerName?: string }) => void
   onOpenWorkloadLogs?: (params: { namespace: string; workloadKind: string; workloadName: string }) => void
@@ -1374,11 +1376,15 @@ interface ResourcesViewProps {
 // Default selected kind
 const DEFAULT_KIND_INFO: SelectedKindInfo = { name: 'pods', kind: 'Pod', group: '' }
 
-// Read initial state from URL — kind is in the path: /resources/{kind}
-function getInitialKindFromURL(): SelectedKindInfo {
-  // Read kind from URL path segment: /resources/{kind}
-  const pathSegments = window.location.pathname.replace(/^\//, '').split('/')
-  const kind = pathSegments.length > 1 && pathSegments[0] === 'resources' ? pathSegments[1] : null
+// Read initial state from URL — kind is in the path: {basePath}/{kind}
+function getInitialKindFromURL(basePath: string = '/resources'): SelectedKindInfo {
+  // Read kind from URL path segment after basePath: {basePath}/{kind}
+  const pathname = window.location.pathname
+  const base = basePath.replace(/\/$/, '') // strip trailing slash
+  let kind: string | null = null
+  if (pathname.startsWith(base + '/')) {
+    kind = pathname.slice(base.length + 1).split('/')[0] || null
+  }
   const group = new URLSearchParams(window.location.search).get('apiGroup') || ''
   if (kind) {
     // Find matching resource from CORE_RESOURCES or use as-is
@@ -1432,12 +1438,13 @@ export function ResourcesView({
   locationSearch = '',
   locationPathname = '',
   onNavigate,
+  basePath = '/resources',
   onOpenLogs,
   onOpenWorkloadLogs,
 }: ResourcesViewProps) {
   const location = useMemo(() => ({ search: locationSearch, pathname: locationPathname }), [locationSearch, locationPathname])
   const initialFilters = getInitialFiltersFromURL()
-  const [selectedKind, setSelectedKind] = useState<SelectedKindInfo>(getInitialKindFromURL)
+  const [selectedKind, setSelectedKind] = useState<SelectedKindInfo>(() => getInitialKindFromURL(basePath))
   const [searchTerm, setSearchTerm] = useState(initialFilters.search)
   const [expandedCategories, setExpandedCategories] = useState<Set<string>>(
     () => persistedExpandedCategories ?? new Set(['Workloads', 'Networking', 'Configuration'])
@@ -2053,7 +2060,7 @@ export function ResourcesView({
       params.delete('resource')
     }
 
-    const newPath = `/resources/${kindInfo.name}`
+    const newPath = `${basePath}/${kindInfo.name}`
     const queryStr = params.toString()
     const newURL = queryStr ? `${newPath}?${queryStr}` : newPath
 
@@ -2062,7 +2069,7 @@ export function ResourcesView({
     } else {
       window.history.replaceState({}, '', newURL)
     }
-  }, [navigate])
+  }, [navigate, basePath])
 
   // Update URL when any filter changes
   useEffect(() => {
