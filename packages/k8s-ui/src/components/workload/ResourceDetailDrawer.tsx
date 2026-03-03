@@ -19,6 +19,10 @@ interface ResourceDetailDrawerProps {
   onExpand?: (resource: SelectedResource) => void
   /** Navigate to another resource within expanded WorkloadView */
   onNavigateToResource?: (resource: SelectedResource) => void
+  /** Height of the host app's top navigation bar in px (default: 49) */
+  headerHeight?: number
+  /** Left offset to exclude (e.g. sidebar width) so expanded mode doesn't cover the sidebar (default: 0) */
+  leftOffset?: number
   /** Render the content inside the drawer */
   children: (props: {
     resource: SelectedResource
@@ -47,7 +51,7 @@ function getDefaultWidth(kind: string): number {
   return WIDE_KINDS.has(kind.toLowerCase()) ? WIDE_WIDTH : DEFAULT_WIDTH
 }
 
-export function ResourceDetailDrawer({ resource, onClose, onNavigate, initialTab, isOpen = true, expanded, onCollapse, onExpand, onNavigateToResource, children }: ResourceDetailDrawerProps) {
+export function ResourceDetailDrawer({ resource, onClose, onNavigate, initialTab, isOpen = true, expanded, onCollapse, onExpand, onNavigateToResource, headerHeight: headerHeightProp, leftOffset = 0, children }: ResourceDetailDrawerProps) {
   const [drawerWidth, setDrawerWidth] = useState(() => getDefaultWidth(resource.kind))
   const [isResizing, setIsResizing] = useState(false)
   const resizeStartX = useRef(0)
@@ -106,7 +110,7 @@ export function ResourceDetailDrawer({ resource, onClose, onNavigate, initialTab
     }
   }, [expanded, onNavigateToResource, onNavigate])
 
-  const headerHeight = 49
+  const headerHeight = headerHeightProp ?? 49
 
   return (
     <div
@@ -119,7 +123,7 @@ export function ResourceDetailDrawer({ resource, onClose, onNavigate, initialTab
         expanded && 'bg-theme-base !border-l-0',
       )}
       style={{
-        width: expanded ? '100vw' : drawerWidth,
+        width: expanded ? `calc(100vw - ${leftOffset}px)` : drawerWidth,
         top: headerHeight,
         height: `calc(100vh - ${headerHeight}px)`,
         // Collapse is instant — no animation, content and width snap together.
