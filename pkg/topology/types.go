@@ -225,14 +225,31 @@ type Relationships struct {
 	Pods        []ResourceRef `json:"pods,omitempty"`        // For Service: pods it routes to
 }
 
+// CertificateInfo holds parsed X.509 certificate metadata for a single certificate.
+type CertificateInfo struct {
+	Subject      string   `json:"subject"`
+	SANs         []string `json:"sans,omitempty"`
+	Issuer       string   `json:"issuer"`
+	SelfSigned   bool     `json:"selfSigned,omitempty"`
+	KeyType      string   `json:"keyType"`
+	SerialNumber string   `json:"serialNumber"`
+	NotBefore    string   `json:"notBefore"`
+	NotAfter     string   `json:"notAfter"`
+	DaysLeft     int      `json:"daysLeft"`
+	Expired      bool     `json:"expired,omitempty"`
+}
+
+// SecretCertificateInfo holds parsed certificate data for a TLS secret.
+// Certificates are in PEM order (leaf-first: index 0 is the server cert, subsequent entries are intermediates/root).
+type SecretCertificateInfo struct {
+	Certificates []CertificateInfo `json:"certificates"`
+}
+
 // ResourceWithRelationships wraps a K8s resource with computed relationships
 type ResourceWithRelationships struct {
-	Resource      any            `json:"resource"`
-	Relationships *Relationships `json:"relationships,omitempty"`
-	// CertificateInfo holds parsed TLS certificate metadata for Secret resources.
-	// Typed as any to avoid an import cycle (actual type: *server.SecretCertificateInfo).
-	// Only populated for kubernetes.io/tls secrets with valid PEM certificate data.
-	CertificateInfo any `json:"certificateInfo,omitempty"`
+	Resource        any                    `json:"resource"`
+	Relationships   *Relationships         `json:"relationships,omitempty"`
+	CertificateInfo *SecretCertificateInfo `json:"certificateInfo,omitempty"`
 }
 
 // ResourceStatus holds computed status for a resource.

@@ -172,7 +172,9 @@ type DynamicCacheConfig struct {
 	Discovery *ResourceDiscovery
 
 	// Changes is the shared channel for resource change notifications.
-	// May be nil if the caller does not need change events.
+	// Pass ResourceCache.ChangesRaw() here so typed and dynamic resource changes
+	// are delivered on the same channel (unified fan-in). May be nil if change
+	// events are not needed.
 	Changes chan ResourceChange
 
 	// OnReceived is called for every dynamic resource change before processing.

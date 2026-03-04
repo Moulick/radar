@@ -22,10 +22,12 @@ func NewPodExecExecutor(client kubernetes.Interface, config *rest.Config, namesp
 		VersionedParams(&corev1.PodExecOptions{
 			Container: containerName,
 			Command:   command,
-			Stdin:     true,
-			Stdout:    true,
-			Stderr:    !tty,
-			TTY:       tty,
+			Stdin:  true,
+			Stdout: true,
+			// When TTY is true, the terminal muxes stderr into stdout, so Stderr must be false.
+			// Setting both TTY and Stderr causes SPDY stream errors on some API servers; matches kubectl exec -it.
+			Stderr: !tty,
+			TTY:    tty,
 		}, scheme.ParameterCodec)
 
 	executor, err := remotecommand.NewSPDYExecutor(config, http.MethodPost, req.URL())

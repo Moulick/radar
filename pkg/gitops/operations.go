@@ -15,6 +15,14 @@ import (
 	"k8s.io/client-go/dynamic"
 )
 
+// Annotation keys written by SetArgoAutoSync when suspending auto-sync, to remember
+// the original prune/selfHeal settings so they can be restored on resume.
+// Exported so consumers can identify or clean up these annotations independently.
+const (
+	ArgoSuspendedPruneAnnotation    = "skyhook.io/suspended-prune"
+	ArgoSuspendedSelfHealAnnotation = "skyhook.io/suspended-selfheal"
+)
+
 // ArgoAppGVR is the GVR for ArgoCD Application resources.
 var ArgoAppGVR = schema.GroupVersionResource{
 	Group:    "argoproj.io",
@@ -152,10 +160,10 @@ func SetArgoAutoSync(ctx context.Context, dynClient dynamic.Interface, namespace
 
 		annotations, _, _ := unstructured.NestedStringMap(app.Object, "metadata", "annotations")
 		if annotations != nil {
-			if v, ok := annotations["radar.skyhook.io/suspended-prune"]; ok {
+			if v, ok := annotations[ArgoSuspendedPruneAnnotation]; ok {
 				prune = v == "true"
 			}
-			if v, ok := annotations["radar.skyhook.io/suspended-selfheal"]; ok {
+			if v, ok := annotations[ArgoSuspendedSelfHealAnnotation]; ok {
 				selfHeal = v == "true"
 			}
 		}
@@ -163,8 +171,8 @@ func SetArgoAutoSync(ctx context.Context, dynClient dynamic.Interface, namespace
 		patch = map[string]any{
 			"metadata": map[string]any{
 				"annotations": map[string]any{
-					"radar.skyhook.io/suspended-prune":    nil,
-					"radar.skyhook.io/suspended-selfheal": nil,
+					ArgoSuspendedPruneAnnotation:    nil,
+					ArgoSuspendedSelfHealAnnotation: nil,
 				},
 			},
 			"spec": map[string]any{
@@ -193,8 +201,8 @@ func SetArgoAutoSync(ctx context.Context, dynClient dynamic.Interface, namespace
 		patch = map[string]any{
 			"metadata": map[string]any{
 				"annotations": map[string]string{
-					"radar.skyhook.io/suspended-prune":    fmt.Sprintf("%v", prune),
-					"radar.skyhook.io/suspended-selfheal": fmt.Sprintf("%v", selfHeal),
+					ArgoSuspendedPruneAnnotation:    fmt.Sprintf("%v", prune),
+					ArgoSuspendedSelfHealAnnotation: fmt.Sprintf("%v", selfHeal),
 				},
 			},
 			"spec": map[string]any{

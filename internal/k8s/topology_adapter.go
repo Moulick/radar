@@ -22,7 +22,11 @@ type topologyResourceProvider struct {
 }
 
 // NewTopologyResourceProvider wraps a ResourceCache as a topology.ResourceProvider.
+// Returns nil if cache is nil; topology.Builder.Build() will return an error in that case.
 func NewTopologyResourceProvider(cache *ResourceCache) topology.ResourceProvider {
+	if cache == nil {
+		return nil
+	}
 	return &topologyResourceProvider{cache: cache}
 }
 

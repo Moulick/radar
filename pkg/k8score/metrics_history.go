@@ -283,10 +283,12 @@ func (s *MetricsHistoryStore) collectPodMetrics(ctx context.Context, now time.Ti
 				containerBuf = newRingBuffer(MetricsHistorySize)
 				podBuf.containers[containerName] = containerBuf
 			}
+			cpuStr, _ := usage["cpu"].(string)
+			memStr, _ := usage["memory"].(string)
 			containerBuf.Add(MetricsDataPoint{
 				Timestamp: now,
-				CPU:       parseCPU(usage["cpu"].(string)),
-				Memory:    parseMemory(usage["memory"].(string)),
+				CPU:       parseCPU(cpuStr),
+				Memory:    parseMemory(memStr),
 			})
 		}
 	}
@@ -346,10 +348,12 @@ func (s *MetricsHistoryStore) collectNodeMetrics(ctx context.Context, now time.T
 		if !ok {
 			continue
 		}
+		cpuStr, _ := usage["cpu"].(string)
+		memStr, _ := usage["memory"].(string)
 		nodeBuf.buffer.Add(MetricsDataPoint{
 			Timestamp: now,
-			CPU:       parseCPU(usage["cpu"].(string)),
-			Memory:    parseMemory(usage["memory"].(string)),
+			CPU:       parseCPU(cpuStr),
+			Memory:    parseMemory(memStr),
 		})
 	}
 

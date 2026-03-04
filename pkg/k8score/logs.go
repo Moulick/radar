@@ -21,6 +21,9 @@ type LogOptions struct {
 // GetContainerLogs returns a stream of logs for a container.
 // The caller is responsible for closing the returned ReadCloser.
 func GetContainerLogs(ctx context.Context, client kubernetes.Interface, namespace, podName, containerName string, opts LogOptions) (io.ReadCloser, error) {
+	if client == nil {
+		return nil, fmt.Errorf("kubernetes client not initialized")
+	}
 	podLogOpts := &corev1.PodLogOptions{
 		Container:    containerName,
 		TailLines:    opts.TailLines,

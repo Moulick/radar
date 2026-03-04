@@ -18,6 +18,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 
 	"github.com/skyhook-io/radar/internal/k8s"
+	"github.com/skyhook-io/radar/pkg/topology"
 )
 
 const (
@@ -25,27 +26,9 @@ const (
 	certExpiryCriticalDays = 7
 )
 
-// CertificateInfo holds parsed X.509 certificate metadata for a single certificate.
-type CertificateInfo struct {
-	Subject      string   `json:"subject"`
-	SANs         []string `json:"sans,omitempty"`
-	Issuer       string   `json:"issuer"`
-	SelfSigned   bool     `json:"selfSigned,omitempty"`
-	KeyType      string   `json:"keyType"`
-	SerialNumber string   `json:"serialNumber"`
-	NotBefore    string   `json:"notBefore"`
-	NotAfter     string   `json:"notAfter"`
-	DaysLeft     int      `json:"daysLeft"`
-	Expired      bool     `json:"expired,omitempty"`
-}
-
-// SecretCertificateInfo holds parsed certificate data for a TLS secret.
-// Attached to secret responses so the frontend doesn't need to parse certs.
-// Certificates are returned in PEM order (conventionally leaf-first: index 0 is the
-// server certificate, subsequent entries are intermediates/root).
-type SecretCertificateInfo struct {
-	Certificates []CertificateInfo `json:"certificates"`
-}
+// Type aliases so existing server code continues to compile unchanged.
+type CertificateInfo = topology.CertificateInfo
+type SecretCertificateInfo = topology.SecretCertificateInfo
 
 // CertExpiry is a lightweight certificate expiry entry for list views.
 type CertExpiry struct {

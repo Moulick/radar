@@ -879,6 +879,7 @@ func (s *Server) getDashboardTopologySummary(namespaces []string) DashboardTopol
 	builder := topology.NewBuilder(k8s.NewTopologyResourceProvider(k8s.GetResourceCache())).WithDynamic(k8s.NewTopologyDynamicProvider(k8s.GetDynamicResourceCache(), k8s.GetResourceDiscovery()))
 	topo, err := builder.Build(opts)
 	if err != nil {
+		log.Printf("[dashboard] Failed to build topology summary: %v", err)
 		return DashboardTopologySummary{}
 	}
 

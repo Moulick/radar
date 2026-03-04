@@ -15,6 +15,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 
 	"github.com/skyhook-io/radar/internal/k8s"
+	"github.com/skyhook-io/radar/internal/timeline"
 )
 
 var testServer *httptest.Server
@@ -130,6 +131,11 @@ func TestMain(m *testing.M) {
 		Context: "fake-test",
 	})
 
+	// Initialize the timeline store so /api/changes endpoints work
+	if err := timeline.InitStore(timeline.DefaultStoreConfig()); err != nil {
+		panic("InitStore: " + err.Error())
+	}
+
 	srv := New(Config{DevMode: true})
 	testServer = httptest.NewServer(srv.Handler())
 
@@ -137,6 +143,7 @@ func TestMain(m *testing.M) {
 
 	testServer.Close()
 	srv.Stop()
+	timeline.ResetStore()
 	k8s.ResetTestState()
 
 	os.Exit(code)
@@ -402,3 +409,315 @@ func TestSmokeEvents(t *testing.T) {
 }
 
 func boolPtr(b bool) *bool { return &b }
+
+// --- Helpers ---
+
+// get is a small helper that issues a GET and returns the response, failing the
+// test on a network error. The caller is responsible for closing the body.
+func get(t *testing.T, path string) *http.Response {
+	t.Helper()
+	resp, err := http.Get(testServer.URL + path)
+	if err != nil {
+		t.Fatalf("GET %s: %v", path, err)
+	}
+	return resp
+}
+
+// assertOK checks for HTTP 200 and decodes the body as JSON into dst.
+// dst may be a *map[string]any or *[]any; pass nil to skip decoding.
+func assertOK(t *testing.T, resp *http.Response, dst any) {
+	t.Helper()
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	if dst == nil {
+		return
+	}
+	if err := json.NewDecoder(resp.Body).Decode(dst); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+}
+
+// assertNoError checks that a decoded map[string]any does not have an "error" field.
+func assertNoError(t *testing.T, body map[string]any) {
+	t.Helper()
+	if errVal, ok := body["error"]; ok {
+		t.Errorf("unexpected error field: %v", errVal)
+	}
+}
+
+// assertKeys checks that all expected keys are present in body.
+func assertKeys(t *testing.T, body map[string]any, keys ...string) {
+	t.Helper()
+	for _, k := range keys {
+		if _, ok := body[k]; !ok {
+			t.Errorf("missing expected field %q", k)
+		}
+	}
+}
+
+// --- Topology ---
+
+func TestSmokeTopologyTrafficView(t *testing.T) {
+	var body map[string]any
+	assertOK(t, get(t, "/api/topology?view=traffic"), &body)
+	assertNoError(t, body)
+	assertKeys(t, body, "nodes", "edges")
+}
+
+func TestSmokeTopologyResourcesView(t *testing.T) {
+	var body map[string]any
+	assertOK(t, get(t, "/api/topology?view=resources"), &body)
+	assertNoError(t, body)
+	assertKeys(t, body, "nodes", "edges")
+}
+
+func TestSmokeTopologyNamespaceFilter(t *testing.T) {
+	var body map[string]any
+	assertOK(t, get(t, "/api/topology?namespace=default"), &body)
+	assertNoError(t, body)
+	assertKeys(t, body, "nodes", "edges")
+
+	nodes, _ := body["nodes"].([]any)
+	if len(nodes) == 0 {
+		t.Error("expected at least 1 node for namespace=default")
+	}
+}
+
+// --- Resources (list) ---
+
+func TestSmokeListResources(t *testing.T) {
+	kinds := []string{
+		"services",
+		"replicasets",
+		"configmaps",
+		"secrets",
+		"nodes",
+		"namespaces",
+	}
+	for _, kind := range kinds {
+		kind := kind
+		t.Run(kind, func(t *testing.T) {
+			var body []any
+			assertOK(t, get(t, "/api/resources/"+kind), &body)
+		})
+	}
+}
+
+func TestSmokeListResourcesNamespaceFilter(t *testing.T) {
+	var body []any
+	assertOK(t, get(t, "/api/resources/deployments?namespace=default"), &body)
+	if len(body) == 0 {
+		t.Error("expected at least 1 deployment in namespace=default")
+	}
+}
+
+func TestSmokeGetService(t *testing.T) {
+	var body map[string]any
+	assertOK(t, get(t, "/api/resources/services/default/nginx"), &body)
+	assertNoError(t, body)
+	if _, ok := body["resource"]; !ok {
+		t.Error("missing 'resource' field")
+	}
+}
+
+func TestSmokeGetResourceBadKind(t *testing.T) {
+	resp := get(t, "/api/resources/doesnotexist/default/foo")
+	defer resp.Body.Close()
+	// Unknown kind returns some error status (400/404/500 depending on dynamic cache availability).
+	// The important thing is it returns valid JSON, not a panic.
+	if resp.StatusCode < 400 {
+		t.Errorf("expected an error status for unknown kind, got %d", resp.StatusCode)
+	}
+	var body map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("expected valid JSON error response, decode failed: %v", err)
+	}
+	if _, ok := body["error"]; !ok {
+		t.Error("expected 'error' field in error response")
+	}
+}
+
+// --- Timeline / Changes ---
+
+func TestSmokeChanges(t *testing.T) {
+	var body []any
+	assertOK(t, get(t, "/api/changes"), &body)
+	// Empty slice is fine — the store is fresh; just ensure no error
+}
+
+func TestSmokeChangesWithFilters(t *testing.T) {
+	var body []any
+	assertOK(t, get(t, "/api/changes?namespace=default&kind=Deployment&limit=10"), &body)
+}
+
+func TestSmokeChangeChildren(t *testing.T) {
+	var body []any
+	assertOK(t, get(t, "/api/changes/deployments/default/nginx/children"), &body)
+}
+
+// --- AI resources ---
+
+func TestSmokeAIListDeployments(t *testing.T) {
+	var body []any
+	assertOK(t, get(t, "/api/ai/resources/deployments"), &body)
+	if len(body) == 0 {
+		t.Error("expected at least 1 AI resource result")
+	}
+}
+
+func TestSmokeAIListVerbosities(t *testing.T) {
+	for _, v := range []string{"summary", "detail", "compact"} {
+		v := v
+		t.Run(v, func(t *testing.T) {
+			var body []any
+			assertOK(t, get(t, "/api/ai/resources/deployments?verbosity="+v), &body)
+		})
+	}
+}
+
+func TestSmokeAIGetDeployment(t *testing.T) {
+	var body map[string]any
+	assertOK(t, get(t, "/api/ai/resources/deployments/default/nginx"), &body)
+	assertNoError(t, body)
+}
+
+func TestSmokeAIGetResourceNotFound(t *testing.T) {
+	resp := get(t, "/api/ai/resources/deployments/default/nonexistent")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", resp.StatusCode)
+	}
+}
+
+// --- Misc read endpoints ---
+
+func TestSmokeConnection(t *testing.T) {
+	var body map[string]any
+	assertOK(t, get(t, "/api/connection"), &body)
+	assertKeys(t, body, "state", "context", "contexts")
+	if body["state"] != string(k8s.StateConnected) {
+		t.Errorf("expected state=%q, got %v", k8s.StateConnected, body["state"])
+	}
+}
+
+func TestSmokeSessions(t *testing.T) {
+	var body map[string]any
+	assertOK(t, get(t, "/api/sessions"), &body)
+	assertKeys(t, body, "portForwards", "execSessions", "total")
+}
+
+func TestSmokePortForwards(t *testing.T) {
+	var body []any
+	assertOK(t, get(t, "/api/portforwards"), &body)
+	// Empty is fine; just ensure 200 + array
+}
+
+func TestSmokeContexts(t *testing.T) {
+	var body []any
+	assertOK(t, get(t, "/api/contexts"), &body)
+}
+
+// --- Debug endpoints ---
+
+func TestSmokeDebugEvents(t *testing.T) {
+	var body map[string]any
+	assertOK(t, get(t, "/api/debug/events"), &body)
+	assertKeys(t, body, "counters", "store_stats", "recent_drops")
+}
+
+func TestSmokeDebugEventsDiagnoseMissingParams(t *testing.T) {
+	resp := get(t, "/api/debug/events/diagnose")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 without required params, got %d", resp.StatusCode)
+	}
+}
+
+func TestSmokeDebugEventsDiagnose(t *testing.T) {
+	var body map[string]any
+	assertOK(t, get(t, "/api/debug/events/diagnose?kind=Deployment&namespace=default&name=nginx"), &body)
+}
+
+func TestSmokeDebugInformers(t *testing.T) {
+	var body map[string]any
+	assertOK(t, get(t, "/api/debug/informers"), &body)
+	assertKeys(t, body, "typedInformers", "dynamicInformers", "watchedResources")
+}
+
+// --- Workload sub-resources ---
+
+func TestSmokeWorkloadPods(t *testing.T) {
+	var body map[string]any
+	assertOK(t, get(t, "/api/workloads/deployments/default/nginx/pods"), &body)
+	assertNoError(t, body)
+	if _, ok := body["pods"]; !ok {
+		t.Error("missing 'pods' field")
+	}
+}
+
+func TestSmokeWorkloadPodsNotFound(t *testing.T) {
+	resp := get(t, "/api/workloads/deployments/default/nonexistent/pods")
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusInternalServerError {
+		t.Errorf("unexpected 500 for nonexistent workload")
+	}
+}
+
+// --- Metrics (nil dynamic client guard) ---
+
+// TestSmokeMetricsNilDynamicClient verifies the metrics endpoints return a proper
+// error (not a panic) when the dynamic client is not yet initialized.
+// Regression test for: pkg/k8score/metrics.go calling client.Resource() on nil.
+func TestSmokeMetricsNilDynamicClient(t *testing.T) {
+	// In the test environment GetDynamicClient() returns nil (no dynamic cache was
+	// initialized). A nil-guard bug causes a panic; chi's Recoverer converts it to
+	// a 500 with no JSON body — we expect a proper JSON error response.
+	for _, path := range []string{
+		"/api/metrics/pods/default/nginx-abc-xyz",
+		"/api/metrics/nodes/fake-node",
+	} {
+		path := path
+		t.Run(path, func(t *testing.T) {
+			resp := get(t, path)
+			defer resp.Body.Close()
+			// Must not be a panic-induced empty 500; JSON body required.
+			var body map[string]any
+			if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+				t.Fatalf("expected valid JSON response (not a panic), got decode error: %v (status=%d)", err, resp.StatusCode)
+			}
+		})
+	}
+}
+
+// --- requireConnected guard (table-driven) ---
+
+func TestSmokeRequireConnected(t *testing.T) {
+	endpoints := []string{
+		"/api/topology",
+		"/api/namespaces",
+		"/api/resources/pods",
+		"/api/resources/deployments/default/nginx",
+		"/api/changes",
+		"/api/ai/resources/deployments",
+	}
+
+	// Temporarily disconnect
+	k8s.SetConnectionStatus(k8s.ConnectionStatus{State: k8s.StateDisconnected})
+	defer k8s.SetConnectionStatus(k8s.ConnectionStatus{
+		State:   k8s.StateConnected,
+		Context: "fake-test",
+	})
+
+	for _, path := range endpoints {
+		path := path
+		t.Run(path, func(t *testing.T) {
+			resp := get(t, path)
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusServiceUnavailable {
+				t.Errorf("expected 503 when disconnected, got %d", resp.StatusCode)
+			}
+		})
+	}
+}

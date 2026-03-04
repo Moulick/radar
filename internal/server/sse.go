@@ -233,6 +233,7 @@ func (b *SSEBroadcaster) initCachedTopology() {
 	builder := topology.NewBuilder(k8s.NewTopologyResourceProvider(k8s.GetResourceCache())).WithDynamic(k8s.NewTopologyDynamicProvider(k8s.GetDynamicResourceCache(), k8s.GetResourceDiscovery()))
 	opts := topology.DefaultBuildOptions()
 	opts.ViewMode = topology.ViewModeResources
+	opts.MaxNodes = 0 // No limit — this topology is only used for relationship lookups, not sent to the browser
 	// Include ReplicaSets in the cache so relationship lookups work for them
 	opts.IncludeReplicaSets = true
 
@@ -438,6 +439,7 @@ func (b *SSEBroadcaster) broadcastTopologyUpdate() {
 	// for relationship lookups, even if no clients are connected
 	fullOpts := topology.DefaultBuildOptions()
 	fullOpts.ViewMode = topology.ViewModeResources
+	fullOpts.MaxNodes = 0 // No limit — this topology is only used for relationship lookups, not sent to the browser
 	fullOpts.IncludeReplicaSets = true // Include for relationship lookups
 	if fullTopo, err := builder.Build(fullOpts); err == nil {
 		b.updateCachedTopology(fullTopo)

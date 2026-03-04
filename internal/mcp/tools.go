@@ -374,7 +374,9 @@ func attachResourceExtras(ctx context.Context, cache *k8s.ResourceCache, result 
 			log.Printf("[mcp] Failed to build topology for relationships %s/%s/%s: %v", kind, namespace, name, err)
 		} else {
 			displayKind := normalizeDisplayKind(kind)
-			if rels := topology.GetRelationships(displayKind, namespace, name, topo, nil, nil); rels != nil {
+			if rels := topology.GetRelationships(displayKind, namespace, name, topo,
+				k8s.NewTopologyResourceProvider(k8s.GetResourceCache()),
+				k8s.NewTopologyDynamicProvider(k8s.GetDynamicResourceCache(), k8s.GetResourceDiscovery())); rels != nil {
 				result["relationships"] = rels
 			}
 		}
@@ -1166,6 +1168,8 @@ func buildDashboard(ctx context.Context, cache *k8s.ResourceCache, namespace str
 	if topo, err := builder.Build(opts); err == nil {
 		d.TopologyNodes = len(topo.Nodes)
 		d.TopologyEdges = len(topo.Edges)
+	} else {
+		log.Printf("[mcp] Failed to build topology for dashboard: %v", err)
 	}
 
 	// Correlate recent changes with problems — only show changes for broken resources

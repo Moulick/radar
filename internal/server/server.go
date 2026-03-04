@@ -921,7 +921,9 @@ func (s *Server) handleGetResource(w http.ResponseWriter, r *http.Request) {
 		// Get relationships from cached topology
 		var relationships *topology.Relationships
 		if cachedTopo := s.broadcaster.GetCachedTopology(); cachedTopo != nil {
-			relationships = topology.GetRelationships(kind, namespace, name, cachedTopo, nil, nil)
+			relationships = topology.GetRelationships(kind, namespace, name, cachedTopo,
+				k8s.NewTopologyResourceProvider(k8s.GetResourceCache()),
+				k8s.NewTopologyDynamicProvider(k8s.GetDynamicResourceCache(), k8s.GetResourceDiscovery()))
 		}
 
 		s.writeJSON(w, topology.ResourceWithRelationships{
@@ -1077,7 +1079,9 @@ func (s *Server) handleGetResource(w http.ResponseWriter, r *http.Request) {
 	// Get relationships from cached topology
 	var relationships *topology.Relationships
 	if cachedTopo := s.broadcaster.GetCachedTopology(); cachedTopo != nil {
-		relationships = topology.GetRelationships(kind, namespace, name, cachedTopo, nil, nil)
+		relationships = topology.GetRelationships(kind, namespace, name, cachedTopo,
+			k8s.NewTopologyResourceProvider(k8s.GetResourceCache()),
+			k8s.NewTopologyDynamicProvider(k8s.GetDynamicResourceCache(), k8s.GetResourceDiscovery()))
 	}
 
 	// Return resource with relationships
