@@ -22,6 +22,7 @@ require (
 	k8s.io/cli-runtime v0.35.1
 	k8s.io/client-go v0.35.1
 	k8s.io/klog/v2 v2.130.1
+	modernc.org/sqlite v1.46.1
 )
 
 require (
@@ -166,7 +167,6 @@ require (
 	modernc.org/libc v1.67.7 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
-	modernc.org/sqlite v1.46.1 // indirect
 	oras.land/oras-go/v2 v2.6.0 // indirect
 	sigs.k8s.io/json v0.0.0-20250730193827-2d320260d730 // indirect
 	sigs.k8s.io/kustomize/api v0.21.0 // indirect

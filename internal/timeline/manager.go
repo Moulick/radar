@@ -107,9 +107,6 @@ func ToLegacyDiffInfo(d *DiffInfo) *DiffInfo     { return pkgtimeline.ToLegacyDi
 
 // Store constructors.
 func NewMemoryStore(maxSize int) *pkgtimeline.MemoryStore { return pkgtimeline.NewMemoryStore(maxSize) }
-func NewSQLiteStore(dbPath string) (*pkgtimeline.SQLiteStore, error) {
-	return pkgtimeline.NewSQLiteStore(dbPath)
-}
 
 // ---------------------------------------------------------------------------
 // Global store singleton

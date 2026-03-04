@@ -367,5 +367,4 @@ func (m *MemoryStore) getOrCompileFilter(presetName string) (*CompiledFilter, er
 	return cf, nil
 }
 
-// Note: groupEvents, groupByOwner, groupByApp, groupByNamespace, and worseHealth
-// are defined in sqlite_store.go and shared by all store implementations
+// Note: groupEvents and helpers are defined in grouping.go

@@ -136,6 +136,11 @@ func CompileFilter(preset *FilterPreset) (*CompiledFilter, error) {
 	return cf, nil
 }
 
+// IncludesManaged reports whether the compiled preset allows managed resources.
+func (cf *CompiledFilter) IncludesManaged() bool {
+	return cf != nil && cf.preset != nil && cf.preset.IncludeManaged
+}
+
 // Matches returns true if the event passes the filter
 func (cf *CompiledFilter) Matches(event *TimelineEvent) bool {
 	if cf == nil || cf.preset == nil {
