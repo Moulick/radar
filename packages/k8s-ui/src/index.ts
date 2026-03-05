@@ -27,3 +27,6 @@ export * from './components/shared'
 
 // Workload components (WorkloadView, ResourceDetailDrawer)
 export * from './components/workload'
+
+// Dock (DockProvider, BottomDock, useDock, useOpenLogs, useOpenWorkloadLogs, useOpenTerminal)
+export * from './components/dock'

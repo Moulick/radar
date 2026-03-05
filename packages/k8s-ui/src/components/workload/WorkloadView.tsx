@@ -440,7 +440,7 @@ export function WorkloadView({
     <div className="flex flex-col h-full w-full bg-theme-base">
       {/* Header */}
       <div className="shrink-0 border-b border-theme-border bg-theme-surface">
-        <div className="px-4 py-3 flex items-start gap-4">
+        <div className="px-6 py-3 flex items-start gap-4">
           {/* Back button */}
           <button
             onClick={onBack}
@@ -512,7 +512,7 @@ export function WorkloadView({
         </div>
 
         {/* Tabs (left) + Actions (right) */}
-        <div className="px-4 flex items-center border-t border-theme-border">
+        <div className="px-6 flex items-center border-t border-theme-border">
           <div className="flex gap-1">
             <TabButton active={activeTab === 'overview'} onClick={() => handleSetTab('overview')}>
               <Layers className="w-4 h-4" />
