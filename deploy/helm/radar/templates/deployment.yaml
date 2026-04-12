@@ -76,6 +76,9 @@ spec:
             {{- if .Values.auth.oidc.insecureSkipVerify }}
             - --auth-oidc-insecure-skip-verify
             {{- end }}
+            {{- if .Values.auth.oidc.backchannelLogout }}
+            - --auth-oidc-backchannel-logout
+            {{- end }}
             {{- end }}
           ports:
             - name: http

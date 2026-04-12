@@ -186,6 +186,10 @@ auth:
     caCert: ""
     # Skip TLS verification for OIDC provider (insecure, dev/test only)
     insecureSkipVerify: false
+    # Enable OIDC Back-Channel Logout endpoint. When enabled, the IdP can POST
+    # a signed logout_token to /auth/backchannel-logout to revoke sessions.
+    # Single-replica only — revocations are stored in memory and lost on pod restart.
+    backchannelLogout: false
 
 # MCP (Model Context Protocol) server for AI tools
 mcp:

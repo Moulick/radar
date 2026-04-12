@@ -66,6 +66,7 @@ func main() {
 	authOIDCPostLogoutRedirectURL := flag.String("auth-oidc-post-logout-redirect-url", "", "URL to redirect after OIDC provider logout (must be registered with IdP)")
 	authOIDCInsecureSkipVerify := flag.Bool("auth-oidc-insecure-skip-verify", false, "Skip TLS certificate verification for OIDC provider (insecure, dev/test only)")
 	authOIDCCACert := flag.String("auth-oidc-ca-cert", "", "Path to CA certificate file for OIDC provider TLS verification")
+	authOIDCBackchannelLogout := flag.Bool("auth-oidc-backchannel-logout", false, "Enable OIDC Back-Channel Logout endpoint (single-replica only)")
 	flag.Parse()
 
 	if *showVersion {
@@ -126,6 +127,7 @@ func main() {
 			OIDCPostLogoutRedirectURL:  *authOIDCPostLogoutRedirectURL,
 			OIDCInsecureSkipVerify:     *authOIDCInsecureSkipVerify,
 			OIDCCACert:                 *authOIDCCACert,
+			OIDCBackchannelLogout:      *authOIDCBackchannelLogout,
 		},
 	}
 
