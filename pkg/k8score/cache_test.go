@@ -1,13 +1,16 @@
 package k8score
 
 import (
+	"fmt"
 	"sync"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 )
 
 func TestNewResourceCache_Basic(t *testing.T) {
@@ -91,6 +94,77 @@ func TestNewResourceCache_DeferredSync(t *testing.T) {
 	}
 	if rc.Secrets() == nil {
 		t.Error("expected Secrets() lister to be available after deferred sync")
+	}
+}
+
+// TestNewResourceCache_DeferredSync_PartialFailure verifies that a permanently
+// failing deferred informer (e.g. HPA autoscaling/v2 on a K8s <1.23 cluster,
+// which responds with "the server could not find the requested resource")
+// does not block sibling deferred informers from becoming ready. It also
+// verifies the DeferredSyncTimeout path flips deferredFailed so stragglers
+// return false from IsDeferredPending.
+func TestNewResourceCache_DeferredSync_PartialFailure(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	// Make HPA LIST fail forever, as happens when the v2 API isn't served.
+	client.PrependReactor("list", "horizontalpodautoscalers", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, fmt.Errorf("the server could not find the requested resource")
+	})
+
+	rc, err := NewResourceCache(CacheConfig{
+		Client: client,
+		ResourceTypes: map[string]bool{
+			Pods:                     true,
+			ConfigMaps:               true,
+			Secrets:                  true,
+			HorizontalPodAutoscalers: true,
+		},
+		DeferredTypes: map[string]bool{
+			ConfigMaps:               true,
+			Secrets:                  true,
+			HorizontalPodAutoscalers: true,
+		},
+		DeferredSyncTimeout: 500 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewResourceCache failed: %v", err)
+	}
+	defer rc.Stop()
+
+	// Poll for ConfigMaps and Secrets to become ready. A failing sibling
+	// (HPA) must not block them.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if rc.ConfigMaps() != nil && rc.Secrets() != nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if rc.ConfigMaps() == nil {
+		t.Error("expected ConfigMaps() to become ready despite sibling HPA failing")
+	}
+	if rc.Secrets() == nil {
+		t.Error("expected Secrets() to become ready despite sibling HPA failing")
+	}
+	if rc.HorizontalPodAutoscalers() == nil {
+		t.Error("HPA lister uses isEnabled(), not isReady() — expected non-nil")
+	}
+
+	// deferredDone must close even though HPA never syncs — otherwise the
+	// SSE warmup completion never fires.
+	select {
+	case <-rc.DeferredDone():
+	case <-time.After(3 * time.Second):
+		t.Fatal("deferredDone never closed after DeferredSyncTimeout")
+	}
+
+	// Post-timeout: ConfigMaps synced fine → IsDeferredPending returns false.
+	// HPA never synced → IsDeferredPending also returns false (because
+	// deferredFailed is set) so HTTP handlers return 403, not perpetual 503.
+	if rc.IsDeferredPending(ConfigMaps) {
+		t.Error("ConfigMaps synced, expected IsDeferredPending=false")
+	}
+	if rc.IsDeferredPending(HorizontalPodAutoscalers) {
+		t.Error("HPA never synced but timeout fired, expected IsDeferredPending=false")
 	}
 }
 
