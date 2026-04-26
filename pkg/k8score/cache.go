@@ -85,10 +85,10 @@ type informerSetup struct {
 
 // NewResourceCache creates and starts a ResourceCache from the given config.
 // Startup has three tiers:
-//   - Critical informers block until synced. If both PatienceWindow and
-//     MinimalSet are set, the cache returns as soon as the minimal set is
-//     ready *after* the patience window elapses (rest of critical promoted
-//     to deferred). Otherwise, falls back to the legacy SyncTimeout path.
+//   - Critical informers block until synced. With PatienceWindow + MinimalSet,
+//     the cache returns as soon as the minimal set is ready *after* the
+//     patience window elapses (rest of critical promoted to deferred). With
+//     SyncTimeout, the cache returns at most after the timeout.
 //   - Deferred informers sync in the background after critical completes.
 //   - Background informers (e.g. Events) sync independently on their own goroutine.
 func NewResourceCache(cfg CacheConfig) (*ResourceCache, error) {
@@ -279,13 +279,13 @@ func NewResourceCache(cfg CacheConfig) (*ResourceCache, error) {
 	// Phase 1: Wait for critical informers.
 	//
 	// Two modes:
-	//   - Patience+MinimalSet (preferred): wait for ALL critical until the
-	//     patience window elapses. Once elapsed, return as soon as the
-	//     minimal set is ready; promote the rest of critical to deferred.
-	//     Keep waiting indefinitely until MinimalSet is satisfied — there
-	//     is no hard timeout, the loading UI handles the wait.
-	//   - SyncTimeout (legacy): wait for ALL critical, hard-cap at the
-	//     timeout, promote everything still pending.
+	//   - Patience+MinimalSet: wait for ALL critical until the patience
+	//     window elapses. Once elapsed, return as soon as the minimal set
+	//     is ready; promote the rest of critical to deferred. Keep waiting
+	//     indefinitely until MinimalSet is satisfied — there is no hard
+	//     timeout, the loading UI handles the wait.
+	//   - SyncTimeout: wait for ALL critical, hard-cap at the timeout,
+	//     promote everything still pending.
 	useMinimalSet := cfg.PatienceWindow > 0 && len(cfg.MinimalSet) > 0
 	timedOut := false
 	patienceElapsed := false
@@ -295,13 +295,34 @@ func NewResourceCache(cfg CacheConfig) (*ResourceCache, error) {
 		// types or unknown keys don't gate first paint).
 		var minimalEntries []informerEntry
 		if useMinimalSet {
+			knownCritical := make(map[string]bool, len(allEntries))
 			for _, e := range allEntries {
+				if !e.deferred {
+					knownCritical[e.key] = true
+				}
 				if e.deferred {
 					continue
 				}
 				if cfg.MinimalSet[e.key] {
 					minimalEntries = append(minimalEntries, e)
 				}
+			}
+			// Validate MinimalSet keys: typos or kinds not enabled produce a
+			// silently-empty minimalEntries → cache returns ~PatienceWindow
+			// later with nothing meaningful synced. Surface that loud.
+			var unknown []string
+			for k := range cfg.MinimalSet {
+				if !knownCritical[k] {
+					unknown = append(unknown, k)
+				}
+			}
+			if len(unknown) > 0 {
+				sort.Strings(unknown)
+				stdlog.Printf("WARNING: MinimalSet keys not registered as critical informers (typo or RBAC-denied?): %s",
+					strings.Join(unknown, ", "))
+			}
+			if len(minimalEntries) == 0 {
+				stdlog.Printf("WARNING: MinimalSet matched no enabled critical informers; first paint will fire as soon as PatienceWindow elapses regardless of sync state")
 			}
 		}
 
@@ -352,11 +373,15 @@ func NewResourceCache(cfg CacheConfig) (*ResourceCache, error) {
 			return true
 		}
 
-		// Initial progress emission so UI shows "0/N" right away.
 		emitProgress(false)
 
+		// Set of minimal-set keys for the post-patience log discrimination.
+		minimalKindSet := make(map[string]bool, len(minimalEntries))
+		for _, e := range minimalEntries {
+			minimalKindSet[e.kind] = true
+		}
+
 		for {
-			// Check if all critical informers are synced — preferred exit.
 			allSynced := true
 			for _, fn := range criticalSyncFuncs {
 				if !fn() {
@@ -368,8 +393,6 @@ func NewResourceCache(cfg CacheConfig) (*ResourceCache, error) {
 				break
 			}
 
-			// Once the patience window has elapsed, exit as soon as the
-			// minimal set is ready. Until then, keep waiting for everything.
 			if patienceElapsed && useMinimalSet && minimalReady() {
 				break
 			}
@@ -379,15 +402,13 @@ func NewResourceCache(cfg CacheConfig) (*ResourceCache, error) {
 				return nil, fmt.Errorf("failed to sync critical resource caches")
 			case <-patienceCh:
 				patienceElapsed = true
-				patienceCh = nil // disable further receives on closed timer
+				patienceCh = nil // disable further receives on the drained timer channel
 			case <-deadlineCh:
 				timedOut = true
 			case <-progressTicker.C:
-				// Log + emit progress callback. Log every tick; the application
-				// callback decides whether to surface anything (e.g. via SSE).
 				counts := rc.GetKindObjectCounts()
 				rc.informerMu.RLock()
-				var synced, pendingParts []string
+				var synced, pendingParts, minimalPending []string
 				for _, s := range rc.informerStatuses {
 					if s.Deferred {
 						continue
@@ -397,12 +418,23 @@ func NewResourceCache(cfg CacheConfig) (*ResourceCache, error) {
 					} else {
 						n := counts[s.Kind]
 						pendingParts = append(pendingParts, fmt.Sprintf("%s(%d)", s.Kind, n))
+						if minimalKindSet[s.Kind] {
+							minimalPending = append(minimalPending, s.Kind)
+						}
 					}
 				}
 				rc.informerMu.RUnlock()
 				if len(pendingParts) > 0 {
-					stdlog.Printf("Critical sync progress: %d/%d synced (%.0fs elapsed) — pending: %s",
-						len(synced), len(synced)+len(pendingParts), time.Since(syncStart).Seconds(), strings.Join(pendingParts, ", "))
+					// After patience elapses, the actual blocker for first paint
+					// is the minimal-set subset, not all of critical — surface it
+					// distinctly so operators know which kind is holding render.
+					if patienceElapsed && len(minimalPending) > 0 {
+						stdlog.Printf("First-paint blocked: %d/%d minimal-set kinds still syncing (%.0fs elapsed) — pending: %s",
+							len(minimalPending), len(minimalEntries), time.Since(syncStart).Seconds(), strings.Join(minimalPending, ", "))
+					} else {
+						stdlog.Printf("Critical sync progress: %d/%d synced (%.0fs elapsed) — pending: %s",
+							len(synced), len(synced)+len(pendingParts), time.Since(syncStart).Seconds(), strings.Join(pendingParts, ", "))
+					}
 				}
 				emitProgress(useMinimalSet && patienceElapsed && minimalReady())
 			default:
@@ -414,10 +446,8 @@ func NewResourceCache(cfg CacheConfig) (*ResourceCache, error) {
 		}
 	}
 
-	// Promotion: any critical informer not yet synced gets reclassified as
-	// deferred so the cache can return. Applies to both the SyncTimeout
-	// (legacy) path and the MinimalSet (new) path. When everything synced
-	// in time, this is a no-op.
+	// Reclassify any critical informer still pending as deferred so the
+	// cache can return. No-op on the all-synced path.
 	var promoted []string
 	rc.informerMu.Lock()
 	for i, e := range allEntries {
@@ -450,8 +480,6 @@ func NewResourceCache(cfg CacheConfig) (*ResourceCache, error) {
 		stdlog.Printf("Critical resource caches synced in %v — UI can render", time.Since(syncStart))
 	}
 
-	// Final progress emission so the UI's "X of Y ready" indicator settles
-	// to the correct state immediately upon return.
 	if cfg.SyncProgress != nil {
 		rc.informerMu.RLock()
 		var synced, total int
@@ -867,12 +895,40 @@ func (rc *ResourceCache) ChangesRaw() chan ResourceChange {
 }
 
 // PromotedKinds returns the list of resource kinds that were promoted from
-// critical to deferred due to SyncTimeout. Empty if sync completed normally.
+// critical to deferred at first paint. Empty if sync completed normally.
+// This is a snapshot from cache construction and does NOT shrink as
+// promoted informers eventually sync — use PendingPromotedKinds for the
+// live "still loading" view (e.g. for UI banners).
 func (rc *ResourceCache) PromotedKinds() []string {
 	if rc == nil {
 		return nil
 	}
 	return rc.promotedKinds
+}
+
+// PendingPromotedKinds returns the subset of PromotedKinds whose informers
+// have not yet completed their initial sync. Drains to empty as the
+// background informers finish, so a UI bound to this method shows a
+// truthful "still loading" indicator.
+func (rc *ResourceCache) PendingPromotedKinds() []string {
+	if rc == nil || len(rc.promotedKinds) == 0 {
+		return nil
+	}
+	rc.informerMu.RLock()
+	defer rc.informerMu.RUnlock()
+	syncedByKind := make(map[string]bool, len(rc.informerStatuses))
+	for _, s := range rc.informerStatuses {
+		if s.Synced {
+			syncedByKind[s.Kind] = true
+		}
+	}
+	var pending []string
+	for _, k := range rc.promotedKinds {
+		if !syncedByKind[k] {
+			pending = append(pending, k)
+		}
+	}
+	return pending
 }
 
 // IsSyncComplete returns true after the initial critical informer sync.

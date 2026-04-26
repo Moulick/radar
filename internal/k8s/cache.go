@@ -65,16 +65,12 @@ var deferredResources = map[string]bool{
 	"limitranges":              true, // audit inheritance lookups, not first-render
 }
 
-// minimalFirstPaintSet is the irreducible subset of critical informers the
-// home dashboard needs to feel coherent. Once these are synced (and the
-// patience window has elapsed), the cache returns and slower critical
-// informers (ingresses, jobs, cronjobs, etc.) continue loading in the
-// background, joining the topology when they arrive.
-//
-// Pods are deliberately included even though they are typically the
-// largest kind — without pods the topology and resource counts are
-// essentially empty. The patience window absorbs pod-sync latency on
-// most clusters; only when it doesn't do we render with what we have.
+// minimalFirstPaintSet is the subset of critical informers the home
+// dashboard needs to feel coherent. Pods are included despite being
+// typically the largest kind — without pods the topology graph and
+// resource counts are empty. The patience window absorbs pod-sync
+// latency on healthy clusters; on slow ones, the user sees a working
+// home view sooner with a "still loading" hint for the rest.
 var minimalFirstPaintSet = map[string]bool{
 	"pods":        true,
 	"namespaces":  true,
@@ -293,11 +289,10 @@ func recordK8sEventToTimeline(obj any) {
 
 // emitSyncProgress is the SyncProgress callback wired into the resource
 // cache. It keeps the connection's progressMessage in step with the live
-// informer-sync count so the connecting screen shows "Loading cluster
-// data… X of Y resource types ready" instead of a frozen "Loading
-// workloads…". After first paint (minimalReady=true), the cache returns
-// and the connection state flips to "connected" — further progress lives
-// in the deferred-loading indicator on the home dashboard.
+// informer-sync count so the connecting screen ticks up instead of
+// sitting on a static message during a 30–60s sync. Once the cache
+// returns and connection state flips to "connected", further progress
+// lives in the home dashboard's deferred-loading indicator.
 func emitSyncProgress(synced, total int, minimalReady bool) {
 	if total == 0 {
 		return

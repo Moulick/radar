@@ -288,6 +288,157 @@ func TestNewResourceCache_MinimalSet_Promotion(t *testing.T) {
 	}
 }
 
+// TestNewResourceCache_SyncTimeout_Promotion covers the legacy hard-cap
+// path used by skyhook-connector. Without PatienceWindow/MinimalSet, a
+// stuck critical informer must promote at SyncTimeout and the cache
+// must return.
+func TestNewResourceCache_SyncTimeout_Promotion(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	client.PrependReactor("list", "ingresses", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, fmt.Errorf("simulated stuck API")
+	})
+
+	start := time.Now()
+	rc, err := NewResourceCache(CacheConfig{
+		Client: client,
+		ResourceTypes: map[string]bool{
+			Pods:      true,
+			Ingresses: true,
+		},
+		SyncTimeout: 200 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewResourceCache failed: %v", err)
+	}
+	defer rc.Stop()
+
+	elapsed := time.Since(start)
+	if elapsed < 200*time.Millisecond {
+		t.Errorf("expected return after SyncTimeout (200ms), got %v", elapsed)
+	}
+	if elapsed > 3*time.Second {
+		t.Errorf("returned far later than SyncTimeout — promotion didn't fire? elapsed=%v", elapsed)
+	}
+
+	promoted := rc.PromotedKinds()
+	if len(promoted) != 1 || promoted[0] != "Ingress" {
+		t.Errorf("expected Ingress to be promoted, got %v", promoted)
+	}
+}
+
+// TestNewResourceCache_MinimalSet_UnknownKey verifies the validation
+// log path: a typo or kind not enabled in ResourceTypes results in an
+// empty effective minimal set; the cache returns at PatienceWindow with
+// nothing meaningfully gating first paint. This is intentionally
+// permissive (we don't fail construction) but the operator must see a
+// warning. We don't capture log output here — just verify the cache
+// still returns and shape is consistent.
+func TestNewResourceCache_MinimalSet_UnknownKey(t *testing.T) {
+	client := fake.NewSimpleClientset()
+
+	start := time.Now()
+	rc, err := NewResourceCache(CacheConfig{
+		Client: client,
+		ResourceTypes: map[string]bool{
+			Pods: true,
+		},
+		PatienceWindow: 200 * time.Millisecond,
+		MinimalSet: map[string]bool{
+			"pod": true, // typo — should be "pods"
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewResourceCache failed: %v", err)
+	}
+	defer rc.Stop()
+
+	// Pods syncs instantly on fake client, so allCritical fires before
+	// patience even elapses — promoted should be empty.
+	if got := rc.PromotedKinds(); len(got) != 0 {
+		t.Errorf("expected no promoted kinds (everything synced), got %v", got)
+	}
+	if rc.Pods() == nil {
+		t.Error("expected Pods() lister to be available")
+	}
+	// Sanity: returned in reasonable time despite the bogus minimal-set key
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Errorf("returned far too late with bogus MinimalSet key: %v", elapsed)
+	}
+}
+
+// TestNewResourceCache_PatienceWindow_WithoutMinimalSet verifies the
+// edge case where only PatienceWindow is set: useMinimalSet is false,
+// so behavior degrades to "wait indefinitely for all critical" with no
+// hard cap. With a fake client that syncs instantly, this should just
+// return on the all-synced path.
+func TestNewResourceCache_PatienceWindow_WithoutMinimalSet(t *testing.T) {
+	client := fake.NewSimpleClientset()
+
+	rc, err := NewResourceCache(CacheConfig{
+		Client: client,
+		ResourceTypes: map[string]bool{
+			Pods: true,
+		},
+		PatienceWindow: 100 * time.Millisecond,
+		// MinimalSet intentionally nil
+	})
+	if err != nil {
+		t.Fatalf("NewResourceCache failed: %v", err)
+	}
+	defer rc.Stop()
+
+	if got := rc.PromotedKinds(); len(got) != 0 {
+		t.Errorf("expected no promotion without MinimalSet, got %v", got)
+	}
+	if rc.Pods() == nil {
+		t.Error("expected Pods() lister to be available")
+	}
+}
+
+// TestPendingPromotedKinds verifies the live-filtered accessor that the
+// dashboard banner relies on: starts equal to PromotedKinds, and shrinks
+// as informers eventually sync.
+func TestPendingPromotedKinds(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	client.PrependReactor("list", "ingresses", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, fmt.Errorf("simulated slow API")
+	})
+
+	rc, err := NewResourceCache(CacheConfig{
+		Client: client,
+		ResourceTypes: map[string]bool{
+			Pods:      true,
+			Services:  true,
+			Ingresses: true,
+		},
+		PatienceWindow: 200 * time.Millisecond,
+		MinimalSet: map[string]bool{
+			Pods:     true,
+			Services: true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewResourceCache failed: %v", err)
+	}
+	defer rc.Stop()
+
+	// At first paint, Ingress is both Promoted and Pending.
+	if got := rc.PromotedKinds(); len(got) != 1 || got[0] != "Ingress" {
+		t.Fatalf("PromotedKinds: expected [Ingress], got %v", got)
+	}
+	if got := rc.PendingPromotedKinds(); len(got) != 1 || got[0] != "Ingress" {
+		t.Errorf("PendingPromotedKinds: expected [Ingress], got %v", got)
+	}
+	// PromotedKinds is a stable historical snapshot, PendingPromotedKinds
+	// is the live view — verify they are distinct concepts and don't
+	// share backing storage.
+	promoted := rc.PromotedKinds()
+	pending := rc.PendingPromotedKinds()
+	if len(promoted) > 0 && len(pending) > 0 && &promoted[0] == &pending[0] {
+		t.Error("PromotedKinds and PendingPromotedKinds must not share backing array")
+	}
+}
+
 func TestNewResourceCache_Callbacks(t *testing.T) {
 	// Pre-create a pod so the informer fires an add event
 	pod := &corev1.Pod{

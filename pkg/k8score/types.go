@@ -141,12 +141,10 @@ type CacheConfig struct {
 	// In connector mode this is true.
 	SuppressInitialAdds bool
 
-	// SyncTimeout is the maximum time to wait for critical informers to sync
-	// before proceeding with partial data. Unsynced critical informers are
-	// promoted to deferred and continue syncing in the background.
-	// Zero means wait indefinitely (original behavior). Prefer PatienceWindow
-	// + MinimalSet for application-driven first-paint, this remains for
-	// backwards compat (skyhook-connector still uses it).
+	// SyncTimeout is a hard cap on the critical-informer wait. When it
+	// fires, unsynced critical informers are promoted to deferred and the
+	// cache returns. Used when PatienceWindow is zero. Zero means wait
+	// indefinitely.
 	SyncTimeout time.Duration
 
 	// PatienceWindow is the soft deadline after which the cache returns as
@@ -169,10 +167,11 @@ type CacheConfig struct {
 	MinimalSet map[string]bool
 
 	// SyncProgress is invoked roughly every second during the critical
-	// sync phase with the current progress. It is also invoked once when
-	// first paint becomes ready (allCritical=true OR minimalReady=true
-	// after the patience window elapsed). Application code uses this to
-	// surface a "loading X of Y resource types" indicator.
+	// sync phase, and once more when first paint is ready. `synced` and
+	// `total` count critical informers; `minimalReady` is true when the
+	// minimal set is satisfied AND the patience window has elapsed (i.e.
+	// the cache is about to return on the partial-paint path).
+	// Application code uses this to drive a "loading X of Y" indicator.
 	SyncProgress func(synced, total int, minimalReady bool)
 
 	// DeferredSyncTimeout caps how long we wait for deferred informers to
