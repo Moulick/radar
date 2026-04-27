@@ -24,6 +24,7 @@ import type {
   ArtifactHubSearchResult,
   ArtifactHubChartDetail,
   GitOpsResourceTree,
+  GitOpsInsight,
 } from '../types'
 import type { GitOpsOperationResponse } from '../types/gitops'
 import { getApiBase, getAuthHeaders, getCredentialsMode, getBasename, routePath } from './config'
@@ -793,6 +794,21 @@ export function useGitOpsTree(kind: string, namespace: string, name: string, gro
   return useQuery<GitOpsResourceTree>({
     queryKey: ['gitops-tree', kind, namespace, name, group, namespaces],
     queryFn: () => fetchJSON(`/gitops/tree/${kind}/${ns}/${name}${queryString ? `?${queryString}` : ''}`),
+    enabled: Boolean(kind && name),
+    staleTime: 5000,
+  })
+}
+
+export function useGitOpsInsights(kind: string, namespace: string, name: string, group?: string, namespaces: string[] = []) {
+  const ns = namespace || '_'
+  const params = new URLSearchParams()
+  if (group) params.set('group', group)
+  if (namespaces.length > 0) params.set('namespaces', namespaces.join(','))
+  const queryString = params.toString()
+
+  return useQuery<GitOpsInsight>({
+    queryKey: ['gitops-insights', kind, namespace, name, group, namespaces],
+    queryFn: () => fetchJSON(`/gitops/insights/${kind}/${ns}/${name}${queryString ? `?${queryString}` : ''}`),
     enabled: Boolean(kind && name),
     staleTime: 5000,
   })
@@ -2238,6 +2254,7 @@ export function useArtifactHubChart(repoName: string, chartName: string, version
 
 interface GitOpsMutationConfig<TVariables> {
   getPath: (variables: TVariables) => string
+  getBody?: (variables: TVariables) => unknown
   errorMessage: string
   successMessage: string
   getInvalidateKeys: (variables: TVariables) => (string | undefined)[][]
@@ -2254,6 +2271,8 @@ function createGitOpsMutation<TVariables>(config: GitOpsMutationConfig<TVariable
       mutationFn: async (variables: TVariables): Promise<GitOpsOperationResponse> => {
         const response = await apiFetch(`${getApiBase()}${config.getPath(variables)}`, {
           method: 'POST',
+          headers: config.getBody ? { 'Content-Type': 'application/json' } : undefined,
+          body: config.getBody ? JSON.stringify(config.getBody(variables)) : undefined,
         })
         if (!response.ok) {
           const error = await response.json().catch(() => ({ error: 'Unknown error' }))
@@ -2276,7 +2295,13 @@ function createGitOpsMutation<TVariables>(config: GitOpsMutationConfig<TVariable
 
 // Common variable types
 type FluxResourceVars = { kind: string; namespace: string; name: string }
-type ArgoAppVars = { namespace: string; name: string }
+type ArgoAppVars = {
+  namespace: string
+  name: string
+  resources?: Array<{ group?: string; kind: string; namespace?: string; name: string }>
+  revision?: string
+  prune?: boolean
+}
 
 // Standard invalidation patterns
 const fluxInvalidateKeys = (v: FluxResourceVars) => [
@@ -2332,6 +2357,11 @@ export const useFluxSyncWithSource = createGitOpsMutation<FluxResourceVars>({
 
 export const useArgoSync = createGitOpsMutation<ArgoAppVars>({
   getPath: (v) => `/argo/applications/${v.namespace}/${v.name}/sync`,
+  getBody: (v) => ({
+    resources: v.resources,
+    revision: v.revision,
+    prune: v.prune,
+  }),
   errorMessage: 'Failed to trigger sync',
   successMessage: 'Sync initiated',
   getInvalidateKeys: argoInvalidateKeys,
