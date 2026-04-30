@@ -262,6 +262,34 @@ export function getHelmStatusColor(status: string): string {
   return HELM_STATUS_COLORS[statusLower] || 'bg-theme-hover/50 text-theme-text-secondary'
 }
 
+/**
+ * Helm release statuses that indicate the install or upgrade did not
+ * complete successfully and the user needs to take recovery action
+ * (rollback / uninstall / inspect logs).
+ *
+ * The Helm SDK distinguishes a handful of failure-shaped statuses;
+ * we treat them all as "actionable failure" in the list view so the
+ * row UI can prompt users toward the drawer's recovery actions.
+ *
+ * @see https://github.com/helm/helm/blob/main/pkg/release/status.go
+ */
+const FAILED_HELM_STATUSES: ReadonlySet<string> = new Set([
+  'failed',
+  'pending-install',
+  'pending-upgrade',
+  'pending-rollback',
+])
+
+/**
+ * Predicate: is the given Helm release status one that the user
+ * needs to recover from? Pure & case-insensitive so it can be used
+ * from any renderer / list cell. (SKY-829 bug 58)
+ */
+export function isFailedHelmStatus(status: string | null | undefined): boolean {
+  if (!status) return false
+  return FAILED_HELM_STATUSES.has(status.toLowerCase())
+}
+
 // =============================================================================
 // VULNERABILITY SEVERITY COLORS - for Trivy and other security scanners
 // =============================================================================

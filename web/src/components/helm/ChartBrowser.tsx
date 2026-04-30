@@ -280,7 +280,29 @@ export function ChartBrowser({ onChartSelect }: ChartBrowserProps) {
                     </p>
                   </div>
                 ) : (
-                  <p className="text-sm mt-1">Try updating your repositories</p>
+                  // The empty state used to read "Try updating your
+                  // repositories" with no button — even though the
+                  // toolbar already has an "Update all" button. Inline
+                  // the action right here so the user doesn't have to
+                  // hunt for it. (SKY-829 bug 33)
+                  <div className="text-sm mt-1 flex flex-col items-center gap-2">
+                    <p>Your repositories may be out of date.</p>
+                    <button
+                      onClick={handleUpdateAllRepos}
+                      disabled={updateRepoMutation.isPending || !canHelmWrite}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs btn-brand rounded disabled:opacity-50"
+                      title={canHelmWrite ? 'Run helm repo update on every configured repository' : helmWriteReason}
+                    >
+                      <RefreshCw className={`w-3.5 h-3.5 ${updateRepoMutation.isPending ? 'animate-spin' : ''}`} />
+                      {updateRepoMutation.isPending ? 'Updating…' : 'Update all repositories'}
+                    </button>
+                    <button
+                      onClick={() => setChartSource('artifacthub')}
+                      className="text-xs text-blue-400 hover:underline"
+                    >
+                      Or browse ArtifactHub instead
+                    </button>
+                  </div>
                 )}
               </div>
             </div>
