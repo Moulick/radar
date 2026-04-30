@@ -36,6 +36,6 @@ export function getChartDisplay(chart: string, version: string): string {
 // Re-export kindToPlural from centralized navigation utils
 export { kindToPlural } from '../../utils/navigation'
 
-// Re-export failure predicate from k8s-ui (where it lives next to the
-// Helm status color palette, and is unit-tested).
-export { isFailedHelmStatus as isFailedReleaseStatus } from '../../utils/badge-colors'
+// Re-export from k8s-ui where the predicate lives next to the
+// Helm status color palette and is unit-tested.
+export { isHelmReleaseActionable } from '../../utils/badge-colors'

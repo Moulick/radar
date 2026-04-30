@@ -2096,6 +2096,32 @@ export function useUpdateRepository() {
   })
 }
 
+// Same endpoint as useUpdateRepository but without success/error
+// meta — the caller surfaces an aggregate result toast for the
+// whole batch, so the global MutationCache must NOT fire a per-call
+// toast (otherwise N failures = N identical "Failed to update
+// repository" toasts with no repo name).
+export function useUpdateRepositorySilent() {
+  const queryClient = useQueryClient()
+
+  return useMutation({
+    mutationFn: async (repoName: string) => {
+      const response = await apiFetch(`${getApiBase()}/helm/repositories/${repoName}/update`, {
+        method: 'POST',
+      })
+      if (!response.ok) {
+        const error = await response.json().catch(() => ({ error: 'Unknown error' }))
+        throw new Error(error.error || `HTTP ${response.status}`)
+      }
+      return response.json()
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['helm-repositories'] })
+      queryClient.invalidateQueries({ queryKey: ['helm-charts'] })
+    },
+  })
+}
+
 // Search charts across all repositories
 export function useSearchCharts(query: string, allVersions = false, enabled = true) {
   return useQuery<ChartSearchResult>({

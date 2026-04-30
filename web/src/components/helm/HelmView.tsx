@@ -6,7 +6,7 @@ import { PaneLoader } from '@skyhook-io/k8s-ui'
 import { clsx } from 'clsx'
 import { useHelmReleases, useHelmBatchUpgradeInfo, isForbiddenError } from '../../api/client'
 import type { HelmRelease, SelectedHelmRelease, UpgradeInfo, ChartSource } from '../../types'
-import { getStatusColor, formatAge, truncate, isFailedReleaseStatus } from './helm-utils'
+import { getStatusColor, formatAge, truncate, isHelmReleaseActionable } from './helm-utils'
 import { SEVERITY_BADGE } from '../../utils/badge-colors'
 import { Tooltip } from '../ui/Tooltip'
 import { ChartBrowser } from './ChartBrowser'
@@ -450,24 +450,18 @@ const ReleaseRow = forwardRef<HTMLTableRowElement, ReleaseRowProps>(
         {release.appVersion ? (
           <span className="text-sm text-theme-text-secondary">{release.appVersion}</span>
         ) : (
-          // Some charts (e.g. argocd) don't declare an `appVersion`
-          // in Chart.yaml — that's valid Helm but the bare "-"
-          // looked like Radar lost data. Tooltip-explain it.
-          // (SKY-829 bug 22)
           <Tooltip content="This chart did not declare an appVersion in Chart.yaml.">
             <span className="text-sm text-theme-text-disabled cursor-help">—</span>
           </Tooltip>
         )}
       </td>
       <td className="px-4 py-3 w-28">
-        {/*
-          Failed releases used to render as just a red badge with no
-          hint that the row is the path forward. Wrap in a tooltip
-          that points users to the drawer's rollback / history /
-          uninstall actions. (SKY-829 bug 58)
-        */}
-        {isFailedReleaseStatus(release.status) ? (
-          <Tooltip content="Click row to view rollback / history / logs and recover">
+        {isHelmReleaseActionable(release.status) ? (
+          // Tooltip copy intentionally avoids "rollback" — clicking
+          // rollback on a still-running pending-install can leave
+          // the release in a worse state. "Inspect" is accurate
+          // for both failed and pending-but-stuck shapes.
+          <Tooltip content="Operation pending or stuck — click row to inspect.">
             <span
               className={clsx('badge inline-flex items-center gap-1', getStatusColor(release.status))}
             >

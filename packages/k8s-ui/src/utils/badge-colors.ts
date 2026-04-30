@@ -263,31 +263,38 @@ export function getHelmStatusColor(status: string): string {
 }
 
 /**
- * Helm release statuses that indicate the install or upgrade did not
- * complete successfully and the user needs to take recovery action
- * (rollback / uninstall / inspect logs).
+ * Helm release statuses where the row UI should signpost the user
+ * toward the drawer (history / rollback / logs).
  *
- * The Helm SDK distinguishes a handful of failure-shaped statuses;
- * we treat them all as "actionable failure" in the list view so the
- * row UI can prompt users toward the drawer's recovery actions.
+ * Two distinct shapes share this bucket because both leave the user
+ * needing to look at the drawer to know what to do next:
  *
- * @see https://github.com/helm/helm/blob/main/pkg/release/status.go
+ *   - `failed` — install/upgrade/rollback returned an error. The
+ *     user needs to inspect logs and probably rollback or uninstall.
+ *   - `pending-install` / `pending-upgrade` / `pending-rollback` —
+ *     an operation is in flight (or, more usefully, was in flight
+ *     when the controller crashed and never wrote a terminal state).
+ *     During a normal install this is transient; if it stays put
+ *     the release is stuck and the drawer shows what happened.
+ *
+ * Pure & case-insensitive so it can be used from any renderer or
+ * list cell. The CALLER is responsible for choosing copy that's
+ * accurate for both shapes — never mention rollback in the
+ * tooltip, since clicking rollback on a still-running install can
+ * leave the release in a worse state.
+ *
+ * @see https://github.com/helm/helm/blob/dev-v3/pkg/release/status.go
  */
-const FAILED_HELM_STATUSES: ReadonlySet<string> = new Set([
+const ACTIONABLE_HELM_STATUSES: ReadonlySet<string> = new Set([
   'failed',
   'pending-install',
   'pending-upgrade',
   'pending-rollback',
 ])
 
-/**
- * Predicate: is the given Helm release status one that the user
- * needs to recover from? Pure & case-insensitive so it can be used
- * from any renderer / list cell. (SKY-829 bug 58)
- */
-export function isFailedHelmStatus(status: string | null | undefined): boolean {
+export function isHelmReleaseActionable(status: string | null | undefined): boolean {
   if (!status) return false
-  return FAILED_HELM_STATUSES.has(status.toLowerCase())
+  return ACTIONABLE_HELM_STATUSES.has(status.toLowerCase())
 }
 
 // =============================================================================
