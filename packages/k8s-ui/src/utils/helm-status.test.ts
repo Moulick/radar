@@ -11,22 +11,22 @@ describe('isHelmReleaseActionable', () => {
     expect(isHelmReleaseActionable('failed')).toBe(true)
   })
 
-  it('returns true for the three pending-* statuses', () => {
-    // pending-* covers two distinct situations: an in-flight
-    // operation (transient) AND a controller that crashed
-    // mid-flight and never wrote a terminal state (stuck). The
-    // tooltip copy in the renderer must be accurate for BOTH —
-    // never mention rollback (clicking rollback on a still-running
-    // install can leave the release in a worse state).
-    expect(isHelmReleaseActionable('pending-install')).toBe(true)
-    expect(isHelmReleaseActionable('pending-upgrade')).toBe(true)
-    expect(isHelmReleaseActionable('pending-rollback')).toBe(true)
-  })
-
   it('is case-insensitive (matches Helm SDK serialisation variants)', () => {
     expect(isHelmReleaseActionable('FAILED')).toBe(true)
     expect(isHelmReleaseActionable('Failed')).toBe(true)
-    expect(isHelmReleaseActionable('PENDING-UPGRADE')).toBe(true)
+  })
+
+  it('returns FALSE for the pending-* in-flight statuses', () => {
+    // These are Helm's NORMAL in-flight states during every
+    // routine install/upgrade/rollback. If we treated them as
+    // actionable, every routine install would briefly attach an
+    // alarming chevron + tooltip to its own row. Until we have
+    // release age available client-side to distinguish
+    // "transient" from "stuck > N min", we give up the
+    // stuck-controller signpost rather than alarm the common case.
+    expect(isHelmReleaseActionable('pending-install')).toBe(false)
+    expect(isHelmReleaseActionable('pending-upgrade')).toBe(false)
+    expect(isHelmReleaseActionable('pending-rollback')).toBe(false)
   })
 
   it('returns false for the success / normal statuses', () => {
@@ -36,8 +36,6 @@ describe('isHelmReleaseActionable', () => {
   })
 
   it('returns false for `uninstalling` (in-progress, not stuck)', () => {
-    // Deliberately NOT actionable — the user shouldn't try to
-    // rollback or interfere with an active uninstall.
     expect(isHelmReleaseActionable('uninstalling')).toBe(false)
   })
 

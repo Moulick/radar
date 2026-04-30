@@ -457,11 +457,7 @@ const ReleaseRow = forwardRef<HTMLTableRowElement, ReleaseRowProps>(
       </td>
       <td className="px-4 py-3 w-28">
         {isHelmReleaseActionable(release.status) ? (
-          // Tooltip copy intentionally avoids "rollback" — clicking
-          // rollback on a still-running pending-install can leave
-          // the release in a worse state. "Inspect" is accurate
-          // for both failed and pending-but-stuck shapes.
-          <Tooltip content="Operation pending or stuck — click row to inspect.">
+          <Tooltip content="Click row to view rollback / history / logs and recover">
             <span
               className={clsx('badge inline-flex items-center gap-1', getStatusColor(release.status))}
             >

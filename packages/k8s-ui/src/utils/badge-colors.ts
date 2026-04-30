@@ -266,30 +266,20 @@ export function getHelmStatusColor(status: string): string {
  * Helm release statuses where the row UI should signpost the user
  * toward the drawer (history / rollback / logs).
  *
- * Two distinct shapes share this bucket because both leave the user
- * needing to look at the drawer to know what to do next:
- *
- *   - `failed` — install/upgrade/rollback returned an error. The
- *     user needs to inspect logs and probably rollback or uninstall.
- *   - `pending-install` / `pending-upgrade` / `pending-rollback` —
- *     an operation is in flight (or, more usefully, was in flight
- *     when the controller crashed and never wrote a terminal state).
- *     During a normal install this is transient; if it stays put
- *     the release is stuck and the drawer shows what happened.
- *
- * Pure & case-insensitive so it can be used from any renderer or
- * list cell. The CALLER is responsible for choosing copy that's
- * accurate for both shapes — never mention rollback in the
- * tooltip, since clicking rollback on a still-running install can
- * leave the release in a worse state.
+ * Currently `failed` only. The `pending-*` statuses (install /
+ * upgrade / rollback) are excluded deliberately: they're Helm's
+ * normal in-flight states during every routine operation. Treating
+ * them as "actionable" would briefly attach an alarming chevron +
+ * tooltip to every install while it ran — indistinguishable from
+ * the genuinely-stuck case (controller crashed mid-flight). Until
+ * we have release age available client-side to disambiguate
+ * "in-flight" from "stuck > N min", we give up the stuck-detect
+ * signpost rather than wrongly alarm the common case.
  *
  * @see https://github.com/helm/helm/blob/dev-v3/pkg/release/status.go
  */
 const ACTIONABLE_HELM_STATUSES: ReadonlySet<string> = new Set([
   'failed',
-  'pending-install',
-  'pending-upgrade',
-  'pending-rollback',
 ])
 
 export function isHelmReleaseActionable(status: string | null | undefined): boolean {

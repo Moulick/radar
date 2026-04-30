@@ -73,6 +73,11 @@ export function ChartBrowser({ onChartSelect }: ChartBrowserProps) {
   // that names the failed repos.
   const updateRepoSilentMutation = useUpdateRepositorySilent()
   const { showError, showSuccess } = useToast()
+  // updateRepoSilentMutation.isPending flips to false BETWEEN
+  // sequential mutateAsync calls, briefly re-enabling the bulk
+  // button mid-loop. Track the whole-batch state explicitly so
+  // the user can't kick off a second concurrent batch.
+  const [isBatchUpdating, setIsBatchUpdating] = useState(false)
 
   const handleUpdateRepo = async (repoName: string) => {
     await updateRepoMutation.mutateAsync(repoName)
@@ -80,15 +85,20 @@ export function ChartBrowser({ onChartSelect }: ChartBrowserProps) {
   }
 
   const handleUpdateAllRepos = async () => {
-    if (!repositories || repositories.length === 0) return
+    if (!repositories || repositories.length === 0 || isBatchUpdating) return
+    setIsBatchUpdating(true)
     const failed: string[] = []
-    for (const repo of repositories) {
-      try {
-        await updateRepoSilentMutation.mutateAsync(repo.name)
-      } catch (err) {
-        failed.push(repo.name)
-        console.warn(`helm repo update failed for "${repo.name}":`, err)
+    try {
+      for (const repo of repositories) {
+        try {
+          await updateRepoSilentMutation.mutateAsync(repo.name)
+        } catch (err) {
+          failed.push(repo.name)
+          console.warn(`helm repo update failed for "${repo.name}":`, err)
+        }
       }
+    } finally {
+      setIsBatchUpdating(false)
     }
     refetchCharts()
     const ok = repositories.length - failed.length
@@ -270,10 +280,10 @@ export function ChartBrowser({ onChartSelect }: ChartBrowserProps) {
             <Tooltip content={canHelmWrite ? "Update all repositories" : helmWriteReason}>
               <button
                 onClick={handleUpdateAllRepos}
-                disabled={updateRepoSilentMutation.isPending || !canHelmWrite}
+                disabled={isBatchUpdating || !canHelmWrite}
                 className="p-2 text-theme-text-secondary hover:text-theme-text-primary hover:bg-theme-elevated rounded-lg disabled:opacity-50"
               >
-                <RefreshCw className={clsx('w-4 h-4', updateRepoSilentMutation.isPending && 'animate-spin')} />
+                <RefreshCw className={clsx('w-4 h-4', isBatchUpdating && 'animate-spin')} />
               </button>
             </Tooltip>
           </>
@@ -308,12 +318,12 @@ export function ChartBrowser({ onChartSelect }: ChartBrowserProps) {
                     <p>Your repositories may be out of date.</p>
                     <button
                       onClick={handleUpdateAllRepos}
-                      disabled={updateRepoSilentMutation.isPending || !canHelmWrite}
+                      disabled={isBatchUpdating || !canHelmWrite}
                       className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs btn-brand rounded disabled:opacity-50"
                       title={canHelmWrite ? 'Run helm repo update on every configured repository' : helmWriteReason}
                     >
-                      <RefreshCw className={`w-3.5 h-3.5 ${updateRepoSilentMutation.isPending ? 'animate-spin' : ''}`} />
-                      {updateRepoSilentMutation.isPending ? 'Updating…' : 'Update all repositories'}
+                      <RefreshCw className={`w-3.5 h-3.5 ${isBatchUpdating ? 'animate-spin' : ''}`} />
+                      {isBatchUpdating ? 'Updating…' : 'Update all repositories'}
                     </button>
                     <button
                       onClick={() => setChartSource('artifacthub')}
