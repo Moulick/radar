@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
@@ -43,7 +44,14 @@ var (
 	contextRegistry map[string]contextEntry
 	// perFileConfigs caches each file's parsed api.Config so GetAvailableContexts
 	// doesn't re-read N files on every call. Keyed by absolute file path.
-	perFileConfigs    map[string]*clientcmdapi.Config
+	perFileConfigs map[string]*clientcmdapi.Config
+	// perFileMtimes lets refreshContextRegistry detect rewritten or
+	// removed kubeconfig files between calls. Without this the
+	// registry is built once at startup and never refreshes, so
+	// destroyed clusters / removed contexts linger in the dropdown
+	// (they only error out when the user tries to switch to them).
+	// Same lifecycle / lock as perFileConfigs.
+	perFileMtimes     map[string]time.Time
 	contextName       string
 	clusterName       string
 	contextNamespace  string // Default namespace from kubeconfig context
@@ -692,11 +700,19 @@ func GetAvailableContexts() ([]ContextInfo, error) {
 		}, nil
 	}
 
-	clientMu.RLock()
+	// Reconcile registry against disk before reading. This is the
+	// only refresh point in multi-file (isolated-load) mode — without
+	// it, kubeconfigs that were rewritten or deleted on disk after
+	// startup keep showing up in the dropdown until the user
+	// restarts Radar (the "junk clusters" complaint).
+	clientMu.Lock()
+	if contextRegistry != nil {
+		refreshContextRegistry(contextRegistry, perFileConfigs, perFileMtimes)
+	}
 	registry := contextRegistry
 	fileConfigs := perFileConfigs
 	currentCtx := contextName
-	clientMu.RUnlock()
+	clientMu.Unlock()
 
 	if registry != nil {
 		// Isolated-load mode: enumerate every registered context, pulling

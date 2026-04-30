@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"sort"
 	"testing"
+	"time"
 
 	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
@@ -386,6 +387,218 @@ func injectEmptyExec(t *testing.T, path, userName string) {
 	}
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatalf("writeback %s: %v", path, err)
+	}
+}
+
+// SKY-834 bug 52: kubeconfig files rewritten or deleted on disk
+// after Radar startup kept showing their old contexts in the
+// cluster dropdown — the in-memory registry was built once in
+// setupIsolatedLoad and never refreshed in multi-file mode. The
+// user saw "junk clusters" that errored out on switch.
+//
+// refreshContextRegistry is the surgical fix: same per-file
+// isolation as buildContextRegistry, but driven by mtime so it
+// only re-parses files that actually changed.
+
+func loadFixture(t *testing.T, paths []string) (
+	map[string]contextEntry,
+	map[string]*clientcmdapi.Config,
+	map[string]time.Time,
+) {
+	t.Helper()
+	registry, fileConfigs := buildContextRegistry(paths)
+	mtimes := make(map[string]time.Time, len(paths))
+	for _, p := range paths {
+		info, err := os.Stat(p)
+		if err != nil {
+			t.Fatalf("stat fixture %s: %v", p, err)
+		}
+		mtimes[p] = info.ModTime()
+	}
+	return registry, fileConfigs, mtimes
+}
+
+func TestRefreshContextRegistry_DropsRemovedFile(t *testing.T) {
+	// CAPI scenario: a file that was watched at startup is removed
+	// from disk (the cluster was destroyed and the controller
+	// cleaned up). All registry entries pointing at that file MUST
+	// disappear from the dropdown on the next refresh, otherwise
+	// the user sees a junk row that errors on switch.
+	dir := t.TempDir()
+	f1 := writeKubeconfig(t, dir, "alive.yaml", "ctx-alive", []kubeEntry{
+		{ctxName: "ctx-alive", userName: "u", clusterName: "c1"},
+	})
+	f2 := writeKubeconfig(t, dir, "doomed.yaml", "ctx-doomed", []kubeEntry{
+		{ctxName: "ctx-doomed", userName: "u", clusterName: "c2"},
+	})
+
+	registry, fileConfigs, mtimes := loadFixture(t, []string{f1, f2})
+	if _, ok := registry["ctx-doomed"]; !ok {
+		t.Fatalf("setup: expected ctx-doomed in registry, got %v", keysOf(registry))
+	}
+
+	if err := os.Remove(f2); err != nil {
+		t.Fatalf("remove fixture: %v", err)
+	}
+
+	changed := refreshContextRegistry(registry, fileConfigs, mtimes)
+	if !changed {
+		t.Errorf("expected refresh to report a change after deleting %s", filepath.Base(f2))
+	}
+	if _, ok := registry["ctx-doomed"]; ok {
+		t.Errorf("ctx-doomed still in registry after file removed: %v", keysOf(registry))
+	}
+	if _, ok := registry["ctx-alive"]; !ok {
+		t.Errorf("ctx-alive should still be in registry: %v", keysOf(registry))
+	}
+	if _, ok := fileConfigs[f2]; ok {
+		t.Errorf("perFileConfigs still has entry for removed file %s", filepath.Base(f2))
+	}
+	if _, ok := mtimes[f2]; ok {
+		t.Errorf("perFileMtimes still has entry for removed file %s", filepath.Base(f2))
+	}
+}
+
+func TestRefreshContextRegistry_DropsContextRemovedFromFile(t *testing.T) {
+	// `kubectl config delete-context` rewrites the kubeconfig in
+	// place: same file, different mtime, fewer contexts. The
+	// removed context MUST disappear from the dropdown.
+	dir := t.TempDir()
+	f1 := writeKubeconfig(t, dir, "two.yaml", "ctx-keep", []kubeEntry{
+		{ctxName: "ctx-keep", userName: "u", clusterName: "c1"},
+		{ctxName: "ctx-delete", userName: "u", clusterName: "c2"},
+	})
+
+	registry, fileConfigs, mtimes := loadFixture(t, []string{f1})
+	if _, ok := registry["ctx-delete"]; !ok {
+		t.Fatalf("setup: expected ctx-delete in registry")
+	}
+
+	rewriteKubeconfig(t, f1, []kubeEntry{
+		{ctxName: "ctx-keep", userName: "u", clusterName: "c1"},
+	})
+
+	changed := refreshContextRegistry(registry, fileConfigs, mtimes)
+	if !changed {
+		t.Errorf("expected refresh to report a change after rewriting %s", filepath.Base(f1))
+	}
+	if _, ok := registry["ctx-delete"]; ok {
+		t.Errorf("ctx-delete still in registry after rewrite: %v", keysOf(registry))
+	}
+	if _, ok := registry["ctx-keep"]; !ok {
+		t.Errorf("ctx-keep should still be in registry: %v", keysOf(registry))
+	}
+}
+
+func TestRefreshContextRegistry_PicksUpNewContextInSameFile(t *testing.T) {
+	// `kubectl config set-context foo` adds a new entry to an
+	// existing file. The new context should appear after refresh
+	// without needing a Radar restart.
+	dir := t.TempDir()
+	f1 := writeKubeconfig(t, dir, "one.yaml", "ctx-original", []kubeEntry{
+		{ctxName: "ctx-original", userName: "u", clusterName: "c1"},
+	})
+	registry, fileConfigs, mtimes := loadFixture(t, []string{f1})
+
+	rewriteKubeconfig(t, f1, []kubeEntry{
+		{ctxName: "ctx-original", userName: "u", clusterName: "c1"},
+		{ctxName: "ctx-new", userName: "u", clusterName: "c2"},
+	})
+
+	changed := refreshContextRegistry(registry, fileConfigs, mtimes)
+	if !changed {
+		t.Errorf("expected refresh to report a change after add")
+	}
+	if _, ok := registry["ctx-new"]; !ok {
+		t.Errorf("ctx-new not picked up after refresh: %v", keysOf(registry))
+	}
+	if _, ok := registry["ctx-original"]; !ok {
+		t.Errorf("ctx-original disappeared from registry: %v", keysOf(registry))
+	}
+}
+
+func TestRefreshContextRegistry_NoOpWhenNothingChanged(t *testing.T) {
+	dir := t.TempDir()
+	f1 := writeKubeconfig(t, dir, "stable.yaml", "ctx-a", []kubeEntry{
+		{ctxName: "ctx-a", userName: "u", clusterName: "c1"},
+	})
+	registry, fileConfigs, mtimes := loadFixture(t, []string{f1})
+	before := keysOf(registry)
+
+	changed := refreshContextRegistry(registry, fileConfigs, mtimes)
+	if changed {
+		t.Errorf("expected no change on stable disk state, got changed=true")
+	}
+	after := keysOf(registry)
+	sort.Strings(before)
+	sort.Strings(after)
+	if len(before) != len(after) {
+		t.Errorf("registry shape changed during no-op refresh: %v vs %v", before, after)
+	}
+}
+
+func TestRefreshContextRegistry_BadParseDoesNotDropExisting(t *testing.T) {
+	// Defensive case: user is mid-edit and saved a syntactically
+	// broken kubeconfig (mtime moved, parse fails). We deliberately
+	// keep the previous registry entries — silently pruning the
+	// dropdown while the user saves would be more confusing than a
+	// momentarily stale entry.
+	dir := t.TempDir()
+	f1 := writeKubeconfig(t, dir, "broken.yaml", "ctx-a", []kubeEntry{
+		{ctxName: "ctx-a", userName: "u", clusterName: "c1"},
+	})
+	registry, fileConfigs, mtimes := loadFixture(t, []string{f1})
+
+	if err := os.WriteFile(f1, []byte("not: valid: yaml: at: all"), 0o600); err != nil {
+		t.Fatalf("rewrite: %v", err)
+	}
+
+	refreshContextRegistry(registry, fileConfigs, mtimes)
+	if _, ok := registry["ctx-a"]; !ok {
+		t.Errorf("ctx-a was dropped on parse failure; expected to keep it: %v", keysOf(registry))
+	}
+}
+
+func keysOf(m map[string]contextEntry) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
+
+func rewriteKubeconfig(t *testing.T, path string, entries []kubeEntry) {
+	t.Helper()
+	cfg := clientcmdapi.NewConfig()
+	for _, e := range entries {
+		cfg.Contexts[e.ctxName] = &clientcmdapi.Context{
+			Cluster:   e.clusterName,
+			AuthInfo:  e.userName,
+			Namespace: e.namespace,
+		}
+		if _, ok := cfg.Clusters[e.clusterName]; !ok {
+			cfg.Clusters[e.clusterName] = &clientcmdapi.Cluster{
+				Server:                "https://" + e.clusterName,
+				InsecureSkipTLSVerify: true,
+			}
+		}
+		if _, ok := cfg.AuthInfos[e.userName]; !ok {
+			cfg.AuthInfos[e.userName] = &clientcmdapi.AuthInfo{Token: "fake-token-for-" + e.userName}
+		}
+	}
+	data, err := clientcmd.Write(*cfg)
+	if err != nil {
+		t.Fatalf("rewrite serialize: %v", err)
+	}
+	// Force a different mtime even if the test writes within the
+	// same filesystem-resolution tick (HFS+ is 1s).
+	time.Sleep(15 * time.Millisecond)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("rewrite %s: %v", path, err)
+	}
+	now := time.Now()
+	if err := os.Chtimes(path, now, now); err != nil {
+		t.Fatalf("chtimes %s: %v", path, err)
 	}
 }
 

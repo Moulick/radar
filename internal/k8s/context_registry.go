@@ -3,9 +3,11 @@ package k8s
 import (
 	"fmt"
 	"log"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
@@ -38,6 +40,12 @@ func setupIsolatedLoad(paths []string) (
 	}
 	contextRegistry = registry
 	perFileConfigs = fileConfigs
+	perFileMtimes = make(map[string]time.Time, len(paths))
+	for _, p := range paths {
+		if info, err := os.Stat(p); err == nil {
+			perFileMtimes[p] = info.ModTime()
+		}
+	}
 	contextName = qName
 	return &clientcmd.ClientConfigLoadingRules{ExplicitPath: entry.SourceFile},
 		&clientcmd.ConfigOverrides{CurrentContext: entry.InFileName},
@@ -164,6 +172,118 @@ func pickInitialContext(
 		}
 	}
 	return "", contextEntry{}, false
+}
+
+// refreshContextRegistry reconciles the in-memory contextRegistry +
+// perFileConfigs against what's actually on disk RIGHT NOW. Returns
+// whether anything changed (so the caller can decide whether to log
+// or invalidate downstream caches).
+//
+// The original registry is built ONCE in setupIsolatedLoad and was
+// never refreshed in multi-file mode. That left the cluster
+// dropdown showing entries for:
+//
+//   - kubeconfig files the user removed from a watched directory,
+//   - kubeconfig files rewritten by `kubectl config delete-context`,
+//   - kubeconfig files written then deleted by CAPI when a managed
+//     cluster was destroyed.
+//
+// All three look like "junk clusters" to the user (the entry is
+// there but selecting it errors out). This helper is the surgical
+// fix: same per-file isolation guarantees as buildContextRegistry,
+// just incremental — it ONLY touches files whose mtime moved or
+// whose path no longer exists on disk.
+//
+// Concurrency: caller MUST hold clientMu (write lock). The helper
+// rebuilds shared map values, so it's not safe to interleave with
+// GetAvailableContexts readers.
+func refreshContextRegistry(
+	registry map[string]contextEntry,
+	fileConfigs map[string]*clientcmdapi.Config,
+	fileMtimes map[string]time.Time,
+) bool {
+	if registry == nil {
+		return false
+	}
+	changed := false
+	// Group registry entries by source file so we can decide
+	// per-file: keep, re-parse, or drop everything pointing at it.
+	byFile := make(map[string][]string)
+	for qName, entry := range registry {
+		byFile[entry.SourceFile] = append(byFile[entry.SourceFile], qName)
+	}
+	for path, qNames := range byFile {
+		info, statErr := os.Stat(path)
+		if statErr != nil {
+			// File is gone (or unreadable). Drop every registry
+			// entry pointing at it AND its cached config. This
+			// is the CAPI-cluster-destroyed and
+			// "user removed file from kubeconfig dir" cases.
+			for _, qName := range qNames {
+				delete(registry, qName)
+			}
+			delete(fileConfigs, path)
+			delete(fileMtimes, path)
+			changed = true
+			continue
+		}
+		mtime := info.ModTime()
+		if cached, ok := fileMtimes[path]; ok && cached.Equal(mtime) {
+			// Unchanged — keep the cached parse + entries.
+			continue
+		}
+		// File is new to us OR has been rewritten on disk. Re-parse
+		// and rebuild ONLY this file's entries.
+		cfg, err := clientcmd.LoadFromFile(path)
+		if err != nil {
+			// Couldn't parse the rewritten file. Don't drop the
+			// existing entries — the user may be mid-edit, and
+			// silently pruning the dropdown while they save would
+			// be more confusing than a stale entry. Log and skip.
+			log.Printf("[k8s-init] refresh: skipping kubeconfig %q (parse failed): %v",
+				filepath.Base(path), err)
+			errorlog.Record("k8s-init", "warning",
+				"refresh: kubeconfig %q failed to load: %s",
+				filepath.Base(path), scrubPathError(err))
+			continue
+		}
+		fileConfigs[path] = cfg
+		fileMtimes[path] = mtime
+		// Replace this file's entries in the registry. Names that
+		// are no longer in the file get dropped; new ones are added.
+		liveNames := make(map[string]struct{}, len(cfg.Contexts))
+		for name := range cfg.Contexts {
+			liveNames[name] = struct{}{}
+		}
+		for _, qName := range qNames {
+			if _, alive := liveNames[registry[qName].InFileName]; !alive {
+				delete(registry, qName)
+				changed = true
+			}
+		}
+		// Add any contexts that are new in this file. We deliberately
+		// re-use qualifyContextName to keep the cross-file collision
+		// behaviour consistent with the initial build.
+		for name := range cfg.Contexts {
+			already := false
+			for _, qName := range qNames {
+				if e, ok := registry[qName]; ok && e.SourceFile == path && e.InFileName == name {
+					already = true
+					break
+				}
+			}
+			if already {
+				continue
+			}
+			qName := qualifyContextName(registry, name, path)
+			registry[qName] = contextEntry{
+				SourceFile: path,
+				InFileName: name,
+			}
+			changed = true
+		}
+	}
+	return changed
 }
 
 // aggregateExecPluginCommands walks every context across every per-file
