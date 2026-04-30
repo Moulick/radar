@@ -495,8 +495,7 @@ function ArtifactHubChartCard({ chart, onSelect }: ArtifactHubChartCardProps) {
         {/* Name and org */}
         <div className="flex-1 min-w-0">
           {/* Tooltip on the truncated name so users can read the
-              full chart name without resizing the panel.
-              (SKY-825 bug 43) */}
+              full chart name without resizing the panel. */}
           <Tooltip content={chart.name} wrapperClassName="block">
             <h4 className="text-sm font-medium text-theme-text-primary truncate">{chart.name}</h4>
           </Tooltip>
