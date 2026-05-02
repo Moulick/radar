@@ -61,6 +61,12 @@ type Server struct {
 	permCache       *auth.PermissionCache
 	oidcHandler     *auth.OIDCHandler
 	saveFileFunc    func(defaultFilename string, data []byte) (string, error)
+	// Short-TTL cache for topology builds. The Topology graph is a
+	// deterministic projection of the informer cache; rebuilding it walks
+	// every resource of every kind. A 5s TTL absorbs the typical bursts
+	// (page-load tree+insights, in-flight 2s polling, dashboard widgets)
+	// without user-visible staleness — controllers reconcile far slower.
+	topoMemo *topology.Memoizer
 }
 
 // Config holds server configuration
@@ -89,6 +95,7 @@ func New(cfg Config) *Server {
 		diagConfig:      cfg.DiagConfig,
 		effectiveConfig: cfg.EffectiveConfig,
 		authConfig:      cfg.AuthConfig,
+		topoMemo:        topology.NewMemoizer(5 * time.Second),
 	}
 
 	// Initialize auth components when auth is enabled
