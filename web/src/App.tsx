@@ -679,7 +679,35 @@ function AppInner() {
         setSelectedHelmRelease({ namespace: ns, name })
       }
     }
-  }, [searchParams])
+
+    // Restore resource drawer selection from URL (back/forward within /resources/{kind}).
+    // Cross-kind navigation re-mounts ResourcesView via key={location.pathname} so its
+    // own mount effect re-reads ?resource=; same-kind back/forward doesn't remount,
+    // so App must reconcile selectedResource here. Only acts on /resources/{kind}.
+    if (mainView === 'resources') {
+      const kindFromPath = location.pathname.match(/^\/resources\/([^/]+)/)?.[1] ?? ''
+      const resourceParam = searchParams.get('resource')
+      if (kindFromPath && resourceParam) {
+        const slashIdx = resourceParam.indexOf('/')
+        const ns = slashIdx > 0 ? resourceParam.slice(0, slashIdx) : ''
+        const name = slashIdx > 0 ? resourceParam.slice(slashIdx + 1) : resourceParam
+        const apiGroup = searchParams.get('apiGroup') ?? ''
+        const next: SelectedResource = { kind: kindFromPath, namespace: ns, name, group: apiGroup }
+        setSelectedResource(prev => {
+          if (
+            prev &&
+            prev.kind === next.kind &&
+            prev.namespace === next.namespace &&
+            prev.name === next.name &&
+            (prev.group ?? '') === (next.group ?? '')
+          ) return prev
+          return next
+        })
+      } else if (kindFromPath && !resourceParam) {
+        setSelectedResource(prev => (prev === null ? prev : null))
+      }
+    }
+  }, [searchParams, location.pathname, mainView])
 
   // Auto-adjust grouping when namespaces change
   useEffect(() => {
