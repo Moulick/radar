@@ -1850,6 +1850,9 @@ export function ResourcesView({
   const hasProcessedInitialResource = useRef(false)
   // Set by sidebar kind change to push a browser history entry (vs replace for filter changes)
   const shouldPushHistory = useRef(false)
+  // Used by the URL-write effect to distinguish drawer-to-drawer navigation (A -> B, push)
+  // from initial open (null -> X) and close (X -> null), which stay as URL replaces.
+  const prevSelectedResourceRef = useRef<SelectedResource | null>(null)
 
   // Ref to search input for keyboard shortcut
   const searchInputRef = useRef<HTMLInputElement>(null)
@@ -2446,12 +2449,12 @@ export function ResourcesView({
   useEffect(() => {
     // Skip URL update if we're syncing FROM the URL (e.g., browser back button)
     if (isSyncingFromURL.current) {
-
+      prevSelectedResourceRef.current = selectedResource ?? null
       return
     }
     // Skip on initial mount so we don't strip ?resource= before the mount effect reads it
     if (!hasProcessedInitialResource.current) {
-
+      prevSelectedResourceRef.current = selectedResource ?? null
       return
     }
     // Skip URL update if selectedResource's kind doesn't match selectedKind (still syncing)
@@ -2462,12 +2465,25 @@ export function ResourcesView({
         return // Wait for kind sync effect to run first
       }
     }
-    // Push history when kind changes (so browser back/forward works), replace for filter changes
-    const pushHistory = shouldPushHistory.current
+    // Push history for navigations (so browser back works); replace for filter / drawer-toggle changes.
+    // A navigation is one of: explicit sidebar/keyboard kind switch (shouldPushHistory),
+    // kind change driven by external setSelectedResource (pathname differs from target — e.g. clicking a
+    // Parent Gateway from a TCPRoute drawer), or a drawer-to-drawer switch within the same kind
+    // (selectedResource A -> B, both non-null and different). Initial open (null -> X) and close (X -> null)
+    // stay as replace because they don't represent a destination the user wants to "go back" to.
+    const targetPath = `${basePath}/${selectedKind.name}`
+    const pathChanged = window.location.pathname !== targetPath
+    const prev = prevSelectedResourceRef.current
+    const current = selectedResource ?? null
+    const drawerSwitched =
+      prev !== null && current !== null &&
+      (prev.namespace !== current.namespace || prev.name !== current.name || prev.kind !== current.kind)
+    const pushHistory = shouldPushHistory.current || pathChanged || drawerSwitched
     shouldPushHistory.current = false
+    prevSelectedResourceRef.current = current
 
     updateURL(selectedKind, searchTerm, columnFilters, problemFilters, showInactiveReplicaSets, selectedResource?.namespace, selectedResource?.name, pushHistory)
-  }, [selectedKind, searchTerm, columnFilters, problemFilters, showInactiveReplicaSets, selectedResource, updateURL])
+  }, [selectedKind, searchTerm, columnFilters, problemFilters, showInactiveReplicaSets, selectedResource, updateURL, basePath])
 
   // Handle resource click from URL on mount
   useEffect(() => {

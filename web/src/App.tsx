@@ -1291,7 +1291,7 @@ function AppInner() {
           onCollapse={handleCollapseFromExpanded}
           onNavigateToResource={(resource) => {
             setSelectedResource(resource)
-            navigate(`/workload/${resource.kind}/${resource.namespace}/${resource.name}`, { replace: true })
+            navigate(`/workload/${resource.kind}/${resource.namespace}/${resource.name}`)
           }}
         />
       )}
