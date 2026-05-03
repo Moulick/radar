@@ -323,8 +323,12 @@ export function AuditFindingsTable({ groups, findings, checks, onResourceClick, 
                 <div
                   role="button"
                   tabIndex={0}
+                  aria-expanded={nsExpanded}
                   onClick={() => toggleNS(ns)}
-                  onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleNS(ns) } }}
+                  onKeyDown={(e) => {
+                    if (e.target !== e.currentTarget) return
+                    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleNS(ns) }
+                  }}
                   className="group flex items-center gap-3 w-full px-4 py-2 rounded-lg hover:bg-theme-hover/30 transition-colors text-left cursor-pointer focus-visible:ring-2 focus-visible:ring-theme-text-primary/20 focus-visible:outline-none"
                 >
                   <ChevronRight className={clsx('w-4 h-4 text-theme-text-tertiary shrink-0 transition-transform duration-200', nsExpanded && 'rotate-90')} />
@@ -439,8 +443,12 @@ function ResourceGroupRow({ group: g, checks, expanded, onToggle, onResourceClic
       <div
         role="button"
         tabIndex={0}
+        aria-expanded={isExpanded}
         onClick={() => onToggle(key)}
-        onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onToggle(key) } }}
+        onKeyDown={(e) => {
+          if (e.target !== e.currentTarget) return
+          if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onToggle(key) }
+        }}
         className="group flex items-center gap-3 w-full px-4 py-2.5 rounded-lg hover:bg-theme-hover/50 transition-colors text-left cursor-pointer focus-visible:ring-2 focus-visible:ring-theme-text-primary/20 focus-visible:outline-none"
       >
         <ChevronRight className={clsx('w-3.5 h-3.5 text-theme-text-tertiary shrink-0 transition-transform duration-200', isExpanded && 'rotate-90')} />
