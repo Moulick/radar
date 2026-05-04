@@ -2442,6 +2442,69 @@ export function useSwitchContext() {
 }
 
 // ============================================================================
+// Active namespace switcher
+// ============================================================================
+
+export interface NamespaceScope {
+  active: string
+  kubeconfigNamespace: string
+  /**
+   * 'cluster-wide' — no override; user can list namespaces.
+   * 'namespace'    — override active; cache scoped to a single namespace.
+   * 'restricted'   — user can't list namespaces and isn't pinned to one.
+   */
+  mode: 'cluster-wide' | 'namespace' | 'restricted'
+  accessibleNamespaces: string[]
+  /** false when accessibleNamespaces is a best-effort short list (no list perm). */
+  authoritative: boolean
+}
+
+export function useNamespaceScope() {
+  return useQuery<NamespaceScope>({
+    queryKey: ['namespace-scope'],
+    queryFn: () => fetchJSON('/cluster/namespace-scope'),
+    staleTime: 30000,
+  })
+}
+
+const NAMESPACE_SWITCH_TIMEOUT = 45000
+
+export function useSetActiveNamespace() {
+  const queryClient = useQueryClient()
+  return useMutation<NamespaceScope, Error, { namespace: string }>({
+    mutationFn: async ({ namespace }) => {
+      const controller = new AbortController()
+      const timeoutId = setTimeout(() => controller.abort(), NAMESPACE_SWITCH_TIMEOUT)
+      try {
+        const response = await apiFetch(`${getApiBase()}/cluster/namespace`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ namespace }),
+          signal: controller.signal,
+        })
+        clearTimeout(timeoutId)
+        if (!response.ok) {
+          const error = await response.json().catch(() => ({ error: 'Unknown error' }))
+          throw new Error(error.error || `HTTP ${response.status}`)
+        }
+        return response.json()
+      } catch (error) {
+        clearTimeout(timeoutId)
+        if (error instanceof Error && error.name === 'AbortError') {
+          throw new Error('Namespace switch timed out. The cluster may be unreachable.')
+        }
+        throw error
+      }
+    },
+    onSuccess: () => {
+      // Cache view changed entirely — wipe everything and refetch.
+      queryClient.removeQueries()
+      queryClient.invalidateQueries()
+    },
+  })
+}
+
+// ============================================================================
 // Image Filesystem Inspection
 // ============================================================================
 

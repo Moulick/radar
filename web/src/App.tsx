@@ -21,6 +21,7 @@ import { PortForwardProvider, PortForwardIndicator, PortForwardPanel } from './c
 import { DockProvider, BottomDock, useDock, useOpenLocalTerminal } from './components/dock'
 import { DURATION_DOCK } from '@skyhook-io/k8s-ui/utils/animation'
 import { ContextSwitcher } from './components/ContextSwitcher'
+import { NamespaceSwitcher } from './components/NamespaceSwitcher'
 import { useNavCustomization } from './context/NavCustomization'
 import { ContextSwitchProvider, useContextSwitch } from './context/ContextSwitchContext'
 import { ConnectionProvider, useConnection } from './context/ConnectionContext'
@@ -34,7 +35,7 @@ import { ShortcutHelpOverlay } from './components/ui/ShortcutHelpOverlay'
 import { CommandPalette } from './components/ui/CommandPalette'
 import { DiagnosticsOverlay } from './components/ui/DiagnosticsOverlay'
 import { useEventSource } from './hooks/useEventSource'
-import { useNamespaces, useSwitchContext, useAuthMe } from './api/client'
+import { useNamespaces, useNamespaceScope, useSwitchContext, useAuthMe } from './api/client'
 import { routePath, apiUrl, getAuthHeaders, getCredentialsMode } from './api/config'
 import { KeyboardShortcutProvider, useRegisterShortcut, useRegisterShortcuts } from './hooks/useKeyboardShortcuts'
 import { useAnimatedUnmount } from './hooks/useAnimatedUnmount'
@@ -453,6 +454,14 @@ function AppInner() {
 
   // Fetch available namespaces
   const { data: availableNamespaces, error: namespacesError } = useNamespaces()
+
+  // Backend's view of cache scope. When mode !== 'cluster-wide' the user's
+  // RBAC pinned them to (or they explicitly chose) a single namespace —
+  // multi-select UI filtering doesn't apply, so we render the cache-scope
+  // switcher in the same header slot instead. Same control location, same
+  // job for the user, just whichever shape matches their actual access.
+  const { data: namespaceScope } = useNamespaceScope()
+  const showCacheScopeSwitcher = namespaceScope?.mode === 'namespace' || namespaceScope?.mode === 'restricted'
 
   // Context switch state
   const { isSwitching, targetContext, progressMessage, updateProgress, endSwitch } = useContextSwitch()
@@ -891,15 +900,24 @@ function AppInner() {
 
         {/* Right: Controls */}
         <div className="flex items-center gap-3 shrink-0">
-          {/* Namespace selector with search */}
-          <NamespaceSelector
-            value={namespaces}
-            onChange={setNamespaces}
-            namespaces={availableNamespaces}
-            namespacesError={namespacesError}
-            disabled={mainView === 'helm'}
-            disabledTooltip="Helm view always shows all namespaces"
-          />
+          {/* Namespace control. Cluster-wide users see the multi-select UI
+              filter (just narrows what each page shows). Restricted /
+              ns-scoped users see the cache-scope switcher in the same slot —
+              for them, "filtering" requires the backend to re-target a
+              different namespace. One control, one location, behavior shaped
+              by what the user can actually do. */}
+          {showCacheScopeSwitcher ? (
+            <NamespaceSwitcher />
+          ) : (
+            <NamespaceSelector
+              value={namespaces}
+              onChange={setNamespaces}
+              namespaces={availableNamespaces}
+              namespacesError={namespacesError}
+              disabled={mainView === 'helm'}
+              disabledTooltip="Helm view always shows all namespaces"
+            />
+          )}
 
           {/* Command palette trigger */}
           <button

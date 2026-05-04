@@ -3,12 +3,17 @@ package k8s
 import (
 	"context"
 	"log"
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	authv1 "k8s.io/api/authorization/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 
 	"github.com/skyhook-io/radar/pkg/k8score"
@@ -51,11 +56,19 @@ type ResourcePermissions struct {
 	HTTPRoutes               bool `json:"httpRoutes"`
 }
 
-// PermissionCheckResult holds the result of RBAC permission checks
+// PermissionCheckResult holds the result of resource access probes.
+//
+// Perms / NamespaceScoped / Namespace are the legacy uniform view (any
+// resource accessible via any scope counts as Perm=true; NamespaceScoped is
+// true if at least one kind ended up scoped to a single namespace). Scopes
+// is the per-kind authoritative view used to wire individual informers
+// — some kinds may be cluster-wide while others are namespace-scoped on the
+// same cluster, which the legacy fields cannot express.
 type PermissionCheckResult struct {
 	Perms           *ResourcePermissions
-	NamespaceScoped bool   // True if permissions are namespace-scoped (not cluster-wide)
-	Namespace       string // The namespace checked, when namespace-scoped
+	NamespaceScoped bool   // True if at least one resource type ended up namespace-scoped
+	Namespace       string // The fallback namespace used for namespace-scoped probes
+	Scopes          map[string]k8score.ResourceScope
 }
 
 // Capabilities represents the features available based on RBAC permissions
@@ -537,194 +550,303 @@ var (
 	resourcePermsErrorTTL = 5 * time.Second // Short TTL when API errors caused fail-closed results
 )
 
-// CheckResourcePermissions checks RBAC permissions for all resource types using
-// SelfSubjectAccessReview. Results are cached for 60 seconds.
-// This is used at informer startup to decide which informers to create.
+// resourceProbe describes one typed-resource probe target. The probe issues
+// `list?limit=1` against this resource (cluster-wide first, then namespace-scoped
+// fallback for non-cluster-scoped kinds when a fallback namespace is set), and
+// the result drives whether an informer is created and at what scope.
+type resourceProbe struct {
+	key          string                       // ResourceType key (k8score.Pods etc.)
+	gvr          schema.GroupVersionResource  // For dynamic-client probe
+	clusterOnly  bool                         // true: cannot be namespace-scoped (nodes, namespaces, PV, storageclasses)
+	field        *bool                        // Pointer into ResourcePermissions for the legacy bool view
+}
+
+// resourceProbeTargets returns the typed informer kinds we probe access for.
+// Includes Gateway / HTTPRoute even though they live in the dynamic cache —
+// the boolean lives in ResourcePermissions and is consumed by the UI snapshot.
+func resourceProbeTargets(perms *ResourcePermissions) []resourceProbe {
+	return []resourceProbe{
+		{k8score.Pods, schema.GroupVersionResource{Version: "v1", Resource: "pods"}, false, &perms.Pods},
+		{k8score.Services, schema.GroupVersionResource{Version: "v1", Resource: "services"}, false, &perms.Services},
+		{k8score.ConfigMaps, schema.GroupVersionResource{Version: "v1", Resource: "configmaps"}, false, &perms.ConfigMaps},
+		{k8score.Secrets, schema.GroupVersionResource{Version: "v1", Resource: "secrets"}, false, &perms.Secrets},
+		{k8score.Events, schema.GroupVersionResource{Version: "v1", Resource: "events"}, false, &perms.Events},
+		{k8score.PersistentVolumeClaims, schema.GroupVersionResource{Version: "v1", Resource: "persistentvolumeclaims"}, false, &perms.PersistentVolumeClaims},
+		{k8score.ServiceAccounts, schema.GroupVersionResource{Version: "v1", Resource: "serviceaccounts"}, false, &perms.ServiceAccounts},
+		{k8score.LimitRanges, schema.GroupVersionResource{Version: "v1", Resource: "limitranges"}, false, &perms.LimitRanges},
+		{k8score.Nodes, schema.GroupVersionResource{Version: "v1", Resource: "nodes"}, true, &perms.Nodes},
+		{k8score.Namespaces, schema.GroupVersionResource{Version: "v1", Resource: "namespaces"}, true, &perms.Namespaces},
+		{k8score.PersistentVolumes, schema.GroupVersionResource{Version: "v1", Resource: "persistentvolumes"}, true, &perms.PersistentVolumes},
+		{k8score.Deployments, schema.GroupVersionResource{Group: "apps", Version: "v1", Resource: "deployments"}, false, &perms.Deployments},
+		{k8score.DaemonSets, schema.GroupVersionResource{Group: "apps", Version: "v1", Resource: "daemonsets"}, false, &perms.DaemonSets},
+		{k8score.StatefulSets, schema.GroupVersionResource{Group: "apps", Version: "v1", Resource: "statefulsets"}, false, &perms.StatefulSets},
+		{k8score.ReplicaSets, schema.GroupVersionResource{Group: "apps", Version: "v1", Resource: "replicasets"}, false, &perms.ReplicaSets},
+		{k8score.Ingresses, schema.GroupVersionResource{Group: "networking.k8s.io", Version: "v1", Resource: "ingresses"}, false, &perms.Ingresses},
+		{k8score.NetworkPolicies, schema.GroupVersionResource{Group: "networking.k8s.io", Version: "v1", Resource: "networkpolicies"}, false, &perms.NetworkPolicies},
+		{k8score.Jobs, schema.GroupVersionResource{Group: "batch", Version: "v1", Resource: "jobs"}, false, &perms.Jobs},
+		{k8score.CronJobs, schema.GroupVersionResource{Group: "batch", Version: "v1", Resource: "cronjobs"}, false, &perms.CronJobs},
+		{k8score.HorizontalPodAutoscalers, schema.GroupVersionResource{Group: "autoscaling", Version: "v2", Resource: "horizontalpodautoscalers"}, false, &perms.HorizontalPodAutoscalers},
+		{k8score.StorageClasses, schema.GroupVersionResource{Group: "storage.k8s.io", Version: "v1", Resource: "storageclasses"}, true, &perms.StorageClasses},
+		{k8score.PodDisruptionBudgets, schema.GroupVersionResource{Group: "policy", Version: "v1", Resource: "poddisruptionbudgets"}, false, &perms.PodDisruptionBudgets},
+		// Gateway/HTTPRoute live in the dynamic cache, but the bool surfaces in the UI.
+		{"gateways", schema.GroupVersionResource{Group: "gateway.networking.k8s.io", Version: "v1", Resource: "gateways"}, false, &perms.Gateways},
+		{"httproutes", schema.GroupVersionResource{Group: "gateway.networking.k8s.io", Version: "v1", Resource: "httproutes"}, false, &perms.HTTPRoutes},
+	}
+}
+
+// sanitizeForLog strips CR/LF from a string before it's written to a log.
+// Use this for any value that originates from user-controlled input
+// (HTTP request bodies, kubeconfig fields edited by the user, etc.) —
+// without it, an attacker-controlled string containing newlines could
+// inject forged log entries. CodeQL's `Log entries created from user
+// input` rule fires on tainted strings even when wrapped in %q because
+// the taint analyzer doesn't model fmt's escaping behavior; an explicit
+// strings.ReplaceAll terminates the taint flow.
+func sanitizeForLog(s string) string {
+	s = strings.ReplaceAll(s, "\n", "")
+	s = strings.ReplaceAll(s, "\r", "")
+	return s
+}
+
+// probeListAccessWith attempts a list?limit=1 against the GVR using the
+// given dynamic client. Returns:
+//   - allowed=true: list succeeded — informer can run.
+//   - allowed=false, forbidden=true: explicit 403/401 — gate the informer.
+//   - allowed=true, transient!=nil: non-auth error (network, 503, NotFound for
+//     missing CRD, etc.). Treated as "allow optimistically" so a transient API
+//     hiccup doesn't permanently disable the resource for the session — the
+//     informer's reflector will retry. Same convention as the dynamic cache
+//     probe in pkg/k8score/dynamic_cache.go.
 //
-// For namespace-scoped users (e.g., ServiceAccounts with RoleBindings), cluster-wide
-// checks will fail. When a fallback namespace is available (from kubeconfig context
-// or --namespace flag), namespace-scoped checks are tried as a second pass.
+// Exposed (lowercase but called from tests in the same package) so tests can
+// drive it with a fake dynamic.Interface.
+func probeListAccessWith(ctx context.Context, dyn dynamic.Interface, gvr schema.GroupVersionResource, namespace string) (allowed bool, forbidden bool, transient error) {
+	if dyn == nil {
+		return false, false, nil
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	opts := metav1.ListOptions{Limit: 1}
+	var err error
+	if namespace != "" {
+		_, err = dyn.Resource(gvr).Namespace(namespace).List(probeCtx, opts)
+	} else {
+		_, err = dyn.Resource(gvr).List(probeCtx, opts)
+	}
+	if err == nil {
+		return true, false, nil
+	}
+	if apierrors.IsForbidden(err) || apierrors.IsUnauthorized(err) {
+		return false, true, nil
+	}
+	return true, false, err
+}
+
+// CheckResourcePermissions probes list access for every typed resource and
+// returns per-kind scope plus a legacy uniform view. Results are cached for
+// 60s (5s on transient errors).
+//
+// Per-kind probe behavior:
+//   - Cluster-wide list?limit=1 first.
+//   - If 403/401 and the kind is namespaceable AND a fallback namespace is set,
+//     retry scoped to that namespace.
+//   - Anything still 403/401 → kind is denied.
+//   - Anything that returns a non-auth error (transient, NotFound for a
+//     missing CRD) → optimistically allowed cluster-wide.
+//
+// This is authoritative because it IS the operation the informer will perform.
+// SelfSubjectAccessReview is one indirection too many — it can disagree with
+// reality on clusters using webhook authorizers (e.g. GKE IAM).
 func CheckResourcePermissions(ctx context.Context) *PermissionCheckResult {
 	resourcePermsMu.RLock()
 	if cachedPermResult != nil && time.Now().Before(resourcePermsExpiry) {
+		// Deep-copy so callers can't mutate the cached result.
 		permsCopy := *cachedPermResult.Perms
+		scopesCopy := make(map[string]k8score.ResourceScope, len(cachedPermResult.Scopes))
+		for k, v := range cachedPermResult.Scopes {
+			scopesCopy[k] = v
+		}
 		result := &PermissionCheckResult{
 			Perms:           &permsCopy,
 			NamespaceScoped: cachedPermResult.NamespaceScoped,
 			Namespace:       cachedPermResult.Namespace,
+			Scopes:          scopesCopy,
 		}
 		resourcePermsMu.RUnlock()
 		return result
 	}
 	resourcePermsMu.RUnlock()
 
-	// Compute RBAC permissions WITHOUT holding the write lock.
-	// Multiple concurrent callers may race, but redundant checks are harmless.
-	// Critical: holding the lock during network calls blocks
-	// InvalidateResourcePermissionsCache() during context switch.
+	// Compute probes WITHOUT holding the write lock — concurrent callers
+	// may race but redundant probes are harmless. Holding the lock during
+	// network calls would block InvalidateResourcePermissionsCache() during
+	// context switch.
 
-	if GetClient() == nil {
+	if GetClient() == nil || GetDynamicClient() == nil {
 		log.Printf("Warning: K8s client not initialized, returning no resource permissions")
-		return &PermissionCheckResult{Perms: &ResourcePermissions{}}
+		return &PermissionCheckResult{Perms: &ResourcePermissions{}, Scopes: map[string]k8score.ResourceScope{}}
 	}
 
-	type permCheck struct {
-		group    string // API group ("" for core, "apps", "batch", etc.)
-		resource string
-		result   *bool
-	}
+	// An in-app override means the user explicitly narrowed the cluster
+	// view to a namespace. Treat that as the desired scope, not a fallback
+	// — even if they have cluster-wide read permission, we should probe
+	// (and watch) inside that namespace so the cache reflects the user's
+	// pick. A bare kubeconfig context namespace stays a fallback only.
+	override := GetActiveNamespaceOverride()
+	scopeNs := GetEffectiveNamespace()
+	forceNs := override != ""
 
-	perms := &ResourcePermissions{}
-	checks := []permCheck{
-		// Core API group
-		{"", "pods", &perms.Pods},
-		{"", "services", &perms.Services},
-		{"", "configmaps", &perms.ConfigMaps},
-		{"", "secrets", &perms.Secrets},
-		{"", "events", &perms.Events},
-		{"", "persistentvolumeclaims", &perms.PersistentVolumeClaims},
-		{"", "nodes", &perms.Nodes},
-		{"", "namespaces", &perms.Namespaces},
-		// apps group
-		{"apps", "deployments", &perms.Deployments},
-		{"apps", "daemonsets", &perms.DaemonSets},
-		{"apps", "statefulsets", &perms.StatefulSets},
-		{"apps", "replicasets", &perms.ReplicaSets},
-		// networking.k8s.io group
-		{"networking.k8s.io", "ingresses", &perms.Ingresses},
-		// gateway.networking.k8s.io group
-		{"gateway.networking.k8s.io", "gateways", &perms.Gateways},
-		{"gateway.networking.k8s.io", "httproutes", &perms.HTTPRoutes},
-		// batch group
-		{"batch", "jobs", &perms.Jobs},
-		{"batch", "cronjobs", &perms.CronJobs},
-		// autoscaling group
-		{"autoscaling", "horizontalpodautoscalers", &perms.HorizontalPodAutoscalers},
-		// core group (cluster-scoped)
-		{"", "persistentvolumes", &perms.PersistentVolumes},
-		// storage.k8s.io group
-		{"storage.k8s.io", "storageclasses", &perms.StorageClasses},
-		// policy group
-		{"policy", "poddisruptionbudgets", &perms.PodDisruptionBudgets},
-		// networking.k8s.io group
-		{"networking.k8s.io", "networkpolicies", &perms.NetworkPolicies},
-		// core (namespaced) — inheritance lookups for audit checks
-		{"", "serviceaccounts", &perms.ServiceAccounts},
-		{"", "limitranges", &perms.LimitRanges},
-	}
-
-	// Phase 1: Check all resources cluster-wide
-	logTiming("   [perms] Phase 1 starting: %d cluster-wide RBAC checks", len(checks))
-	phase1Start := time.Now()
-	var wg sync.WaitGroup
-	var hadErrors atomic.Bool
-	wg.Add(len(checks))
-
-	for _, check := range checks {
-		go func(c permCheck) {
-			defer wg.Done()
-			allowed, apiErr := canI(ctx, "", c.group, c.resource, "list")
-			*c.result = allowed
-			if apiErr {
-				hadErrors.Store(true)
-			}
-		}(check)
-	}
-
-	wg.Wait()
-	logTiming("    RBAC phase 1 (cluster-wide, %d checks): %v", len(checks), time.Since(phase1Start))
-
-	// Bail early if context was canceled (e.g., version check failed while
-	// RBAC checks were in-flight). No point starting Phase 2.
-	if ctx.Err() != nil {
-		logTiming("   [perms] Bailing after Phase 1: context canceled")
-		result := &PermissionCheckResult{Perms: perms}
-		resourcePermsMu.Lock()
-		cachedPermResult = result
-		resourcePermsExpiry = time.Now().Add(resourcePermsErrorTTL)
-		resourcePermsMu.Unlock()
-		return result
-	}
-
-	// Phase 2: If all namespace-scoped resources failed and we have a fallback namespace,
-	// retry those checks scoped to the specific namespace.
-	fallbackNs := GetEffectiveNamespace()
-	namespaceScoped := false
-
-	if fallbackNs != "" {
-		allNamespacedFailed := true
-		for _, check := range checks {
-			if !clusterScopedResources[check.resource] && *check.result {
-				allNamespacedFailed = false
-				break
-			}
-		}
-
-		if allNamespacedFailed {
-			log.Printf("RBAC: cluster-wide checks failed for all namespaced resources, retrying in namespace %q", fallbackNs)
-
-			var nsChecks []permCheck
-			for i := range checks {
-				if !clusterScopedResources[checks[i].resource] {
-					nsChecks = append(nsChecks, checks[i])
-				}
-			}
-
-			wg.Add(len(nsChecks))
-			for _, check := range nsChecks {
-				go func(c permCheck) {
-					defer wg.Done()
-					allowed, apiErr := canI(ctx, fallbackNs, c.group, c.resource, "list")
-					*c.result = allowed
-					if apiErr {
-						hadErrors.Store(true)
-					}
-				}(check)
-			}
-			wg.Wait()
-
-			// If any namespace-scoped check passed, we're in namespace-scoped mode
-			for _, check := range nsChecks {
-				if *check.result {
-					namespaceScoped = true
-					break
-				}
-			}
-		}
-	}
-
-	// Log which resources are restricted
-	var restricted []string
-	for _, check := range checks {
-		if !*check.result {
-			restricted = append(restricted, check.resource)
-		}
-	}
-	if len(restricted) > 0 {
-		if namespaceScoped {
-			log.Printf("RBAC: namespace-scoped mode (namespace=%s), restricted resources: %v", fallbackNs, restricted)
-		} else {
-			log.Printf("RBAC: restricted resources (no list permission): %v", restricted)
-		}
-	}
-
-	result := &PermissionCheckResult{
-		Perms:           perms,
-		NamespaceScoped: namespaceScoped,
-		Namespace:       fallbackNs,
-	}
+	result, hadErrors := probeResourceAccess(ctx, GetDynamicClient(), scopeNs, forceNs)
 
 	resourcePermsMu.Lock()
 	cachedPermResult = result
 	ttl := resourcePermsTTL
-	if hadErrors.Load() {
+	if hadErrors {
 		ttl = resourcePermsErrorTTL
-		log.Printf("Warning: resource permission checks had API errors, using short cache TTL (%v)", ttl)
+		log.Printf("Warning: resource access probes had API errors, using short cache TTL (%v)", ttl)
 	}
 	resourcePermsExpiry = time.Now().Add(ttl)
 	resourcePermsMu.Unlock()
 
 	return result
+}
+
+// probeResourceAccess is the testable inner of CheckResourcePermissions.
+// It does the actual probing with the supplied dynamic client and namespace,
+// with no caching and no global state. The returned bool is true when at
+// least one probe hit a non-auth (transient) error — caller uses this to
+// shorten the cache TTL so the next attempt re-probes.
+//
+// scopeNs and forceNamespace together describe the namespace's role:
+//   - forceNamespace=true: user explicitly chose this namespace (in-app
+//     override). Probe ONLY namespace-scoped — never cluster-wide. Even
+//     when the user has cluster-wide read, we want the informer scoped
+//     so the UI reflects their intent. Cluster-scoped kinds (nodes,
+//     namespaces, PV, storageclasses) are skipped entirely in this mode.
+//   - forceNamespace=false: scopeNs is a kubeconfig fallback only. Probe
+//     cluster-wide first; on 403 retry namespace-scoped against scopeNs.
+func probeResourceAccess(ctx context.Context, dyn dynamic.Interface, scopeNs string, forceNamespace bool) (*PermissionCheckResult, bool) {
+	perms := &ResourcePermissions{}
+	probes := resourceProbeTargets(perms)
+
+	type probeOutcome struct {
+		scope k8score.ResourceScope
+	}
+	outcomes := make([]probeOutcome, len(probes))
+
+	logTiming("   [perms] Probing list access for %d typed resources (scopeNs=%q forced=%v)", len(probes), scopeNs, forceNamespace)
+	probeStart := time.Now()
+	var wg sync.WaitGroup
+	var hadErrors atomic.Bool
+	wg.Add(len(probes))
+
+	for i, p := range probes {
+		go func(i int, p resourceProbe) {
+			defer wg.Done()
+
+			if forceNamespace {
+				// User-pinned namespace: skip cluster-wide entirely. Cluster-scoped
+				// kinds can't live in a namespace, so they're disabled in this mode.
+				if p.clusterOnly || scopeNs == "" {
+					return
+				}
+				nsAllowed, _, nsTransient := probeListAccessWith(ctx, dyn, p.gvr, scopeNs)
+				if nsTransient != nil {
+					hadErrors.Store(true)
+				}
+				if nsAllowed {
+					outcomes[i] = probeOutcome{scope: k8score.ResourceScope{Enabled: true, Namespace: scopeNs}}
+				}
+				return
+			}
+
+			allowed, forbidden, transient := probeListAccessWith(ctx, dyn, p.gvr, "")
+			if transient != nil {
+				hadErrors.Store(true)
+			}
+			if allowed {
+				outcomes[i] = probeOutcome{scope: k8score.ResourceScope{Enabled: true, Namespace: ""}}
+				return
+			}
+			// Cluster-wide denied. Cluster-scoped kinds have no fallback.
+			if !forbidden || p.clusterOnly || scopeNs == "" {
+				return
+			}
+			nsAllowed, _, nsTransient := probeListAccessWith(ctx, dyn, p.gvr, scopeNs)
+			if nsTransient != nil {
+				hadErrors.Store(true)
+			}
+			if nsAllowed {
+				outcomes[i] = probeOutcome{scope: k8score.ResourceScope{Enabled: true, Namespace: scopeNs}}
+			}
+		}(i, p)
+	}
+
+	wg.Wait()
+	logTiming("    Probe phase (%d resources): %v", len(probes), time.Since(probeStart))
+
+	if ctx.Err() != nil {
+		logTiming("   [perms] Bailing after probes: context canceled")
+		return &PermissionCheckResult{Perms: perms, Scopes: map[string]k8score.ResourceScope{}}, true
+	}
+
+	// Apply outcomes to perms (legacy bool view) and build the scope map.
+	scopes := make(map[string]k8score.ResourceScope, len(probes))
+	namespaceScoped := false
+	var (
+		restricted   []string
+		nsScopedKeys []string
+	)
+	for i, p := range probes {
+		r := outcomes[i]
+		scopes[p.key] = r.scope
+		if r.scope.Enabled {
+			*p.field = true
+			if r.scope.Namespace != "" {
+				namespaceScoped = true
+				nsScopedKeys = append(nsScopedKeys, p.key)
+			}
+		} else {
+			restricted = append(restricted, p.key)
+		}
+	}
+
+	// scopeNs traces back to user-controlled input via SetActiveNamespaceOverride
+	// (the in-app namespace switcher POSTs an arbitrary string). Strip CR/LF
+	// so a malicious namespace name can't forge fake log lines (CodeQL's
+	// taint analysis doesn't model %q escaping, so be explicit).
+	logSafeNs := sanitizeForLog(scopeNs)
+	if len(restricted) > 0 {
+		sort.Strings(restricted)
+		if namespaceScoped {
+			sort.Strings(nsScopedKeys)
+			log.Printf("RBAC: mixed scope (namespace=%q; ns-scoped: %s); denied: %s",
+				logSafeNs, strings.Join(nsScopedKeys, ", "), strings.Join(restricted, ", "))
+		} else {
+			log.Printf("RBAC: restricted resources (no list permission): %s", strings.Join(restricted, ", "))
+		}
+	} else if namespaceScoped {
+		sort.Strings(nsScopedKeys)
+		log.Printf("RBAC: mixed scope (namespace=%q; ns-scoped: %s); all kinds accessible",
+			logSafeNs, strings.Join(nsScopedKeys, ", "))
+	}
+
+	// In forced-namespace mode the user's intent is to be ns-scoped — even
+	// if every typed probe failed (e.g. they picked a namespace they have
+	// no access to). Force NamespaceScoped=true so the dynamic cache scopes
+	// CRD informers to the same namespace and doesn't silently fall through
+	// to cluster-wide watches.
+	if forceNamespace && scopeNs != "" {
+		namespaceScoped = true
+	}
+
+	return &PermissionCheckResult{
+		Perms:           perms,
+		NamespaceScoped: namespaceScoped,
+		Namespace:       scopeNs,
+		Scopes:          scopes,
+	}, hadErrors.Load()
 }
 
 // GetCachedPermissionResult returns the cached permission check result, if available.

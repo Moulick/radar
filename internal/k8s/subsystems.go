@@ -76,6 +76,11 @@ func InitAllSubsystems(ctx context.Context, progress func(string)) error {
 		logTiming("   [ops] Skipping API discovery goroutine: context already canceled")
 	}
 
+	// Restore the user's last-saved namespace override for this context
+	// (if any) BEFORE the cache initializes — the override feeds into the
+	// access probes and the per-kind scope decisions.
+	applySavedNamespaceOverride()
+
 	// Resource cache init (RBAC checks + informer sync) — the dominant cost
 	if err := InitResourceCache(ctx); err != nil {
 		// Don't block on discovery — the goroutine may be stuck in an API call

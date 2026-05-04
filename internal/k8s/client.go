@@ -1,6 +1,7 @@
 package k8s
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -10,7 +11,9 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
@@ -46,8 +49,9 @@ var (
 	perFileConfigs    map[string]*clientcmdapi.Config
 	contextName       string
 	clusterName       string
-	contextNamespace  string // Default namespace from kubeconfig context
-	fallbackNamespace string // Explicit namespace from --namespace flag
+	contextNamespace        string // Default namespace from kubeconfig context
+	fallbackNamespace       string // Explicit namespace from --namespace flag
+	activeNamespaceOverride string // User-chosen namespace from in-app switcher (highest precedence)
 	contextUsesExec   bool   // True when the current context uses an exec credential plugin
 	// execPluginCommands is the set of unique exec-auth plugin command basenames
 	// referenced by any context in the merged kubeconfig. Populated from
@@ -649,15 +653,87 @@ func SetFallbackNamespace(ns string) {
 	fallbackNamespace = ns
 }
 
+// SetActiveNamespaceOverride sets a user-chosen namespace override that takes
+// precedence over the kubeconfig context namespace and --namespace flag. This
+// is what the in-app namespace switcher writes to (k9s :ns equivalent).
+//
+// An empty string clears the override so GetEffectiveNamespace falls back to
+// the kubeconfig-derived value. Cleared automatically on context switch since
+// namespace lists are cluster-specific.
+func SetActiveNamespaceOverride(ns string) {
+	clientMu.Lock()
+	defer clientMu.Unlock()
+	activeNamespaceOverride = ns
+}
+
+// GetActiveNamespaceOverride returns the user-chosen namespace, or empty if
+// no override is set. Distinct from GetEffectiveNamespace which folds in
+// kubeconfig + flag fallbacks.
+func GetActiveNamespaceOverride() string {
+	clientMu.RLock()
+	defer clientMu.RUnlock()
+	return activeNamespaceOverride
+}
+
 // GetEffectiveNamespace returns the namespace to use for RBAC fallback checks.
-// Prefers the kubeconfig context namespace, falls back to the explicit --namespace flag.
+// Precedence: in-app override > kubeconfig context namespace > --namespace flag.
 func GetEffectiveNamespace() string {
 	clientMu.RLock()
 	defer clientMu.RUnlock()
+	if activeNamespaceOverride != "" {
+		return activeNamespaceOverride
+	}
 	if contextNamespace != "" {
 		return contextNamespace
 	}
 	return fallbackNamespace
+}
+
+// GetAccessibleNamespaces returns the list of namespaces the user has
+// access to plus a flag indicating whether the list is authoritative.
+//
+//   - If the cluster-wide `list namespaces` succeeds (cluster-wide read),
+//     returns every namespace and authoritative=true.
+//   - Otherwise the user is namespace-restricted; returns a best-effort
+//     short list (active override + kubeconfig context namespace +
+//     --namespace flag, deduped) and authoritative=false. The UI uses
+//     authoritative=false to show "no full visibility" affordances.
+func GetAccessibleNamespaces(ctx context.Context) ([]string, bool) {
+	client := GetClient()
+	if client == nil {
+		return nil, false
+	}
+
+	listCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	list, err := client.CoreV1().Namespaces().List(listCtx, metav1.ListOptions{})
+	if err == nil {
+		names := make([]string, 0, len(list.Items))
+		for _, ns := range list.Items {
+			names = append(names, ns.Name)
+		}
+		sort.Strings(names)
+		return names, true
+	}
+
+	// Cluster-wide list denied (or transient). Best-effort fallback so
+	// the picker isn't empty for a namespace-scoped user.
+	seen := map[string]bool{}
+	var fallback []string
+	for _, ns := range []string{GetActiveNamespaceOverride(), GetContextNamespace()} {
+		if ns != "" && !seen[ns] {
+			seen[ns] = true
+			fallback = append(fallback, ns)
+		}
+	}
+	clientMu.RLock()
+	if fallbackNamespace != "" && !seen[fallbackNamespace] {
+		fallback = append(fallback, fallbackNamespace)
+	}
+	clientMu.RUnlock()
+	sort.Strings(fallback)
+	return fallback, false
 }
 
 // ForceInCluster overrides in-cluster detection for testing
@@ -864,6 +940,10 @@ func SwitchContext(name string) error {
 	contextName = name
 	clusterName = ctx.Cluster
 	contextNamespace = ctx.Namespace
+	// The user's per-cluster namespace pick is meaningless against a
+	// different cluster's namespace list. Caller (PerformContextSwitch)
+	// is expected to restore from settings if a saved override exists.
+	activeNamespaceOverride = ""
 	contextUsesExec = usesExec
 	totalContextCount = totalContexts
 	execPluginCommands = execCmds

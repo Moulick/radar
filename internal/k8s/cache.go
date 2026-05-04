@@ -122,51 +122,33 @@ func InitResourceCache(ctx context.Context) error {
 			return
 		}
 
-		// Check RBAC permissions for all resource types before creating informers.
+		// Probe per-resource list access before creating informers. The
+		// returned scope map is authoritative for both enablement and
+		// per-kind namespace scoping (some kinds may be cluster-wide while
+		// others are namespace-scoped to the same fallback namespace).
 		rbacStart := time.Now()
 		rbacCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 		permResult := CheckResourcePermissions(rbacCtx)
 		cancel()
-		logTiming("    RBAC permission checks: %v", time.Since(rbacStart))
+		logTiming("    Resource access probes: %v", time.Since(rbacStart))
 
 		if ctx.Err() != nil {
 			initErr = ctx.Err()
 			return
 		}
 
-		perms := permResult.Perms
-
-		enabled := map[string]bool{
-			"pods":                     perms.Pods,
-			"services":                 perms.Services,
-			"deployments":              perms.Deployments,
-			"daemonsets":               perms.DaemonSets,
-			"statefulsets":             perms.StatefulSets,
-			"replicasets":              perms.ReplicaSets,
-			"ingresses":                perms.Ingresses,
-			"configmaps":               perms.ConfigMaps,
-			"secrets":                  perms.Secrets,
-			"events":                   perms.Events,
-			"persistentvolumeclaims":   perms.PersistentVolumeClaims,
-			"nodes":                    perms.Nodes,
-			"namespaces":               perms.Namespaces,
-			"jobs":                     perms.Jobs,
-			"cronjobs":                 perms.CronJobs,
-			"horizontalpodautoscalers": perms.HorizontalPodAutoscalers,
-			"persistentvolumes":        perms.PersistentVolumes,
-			"storageclasses":           perms.StorageClasses,
-			"poddisruptionbudgets":     perms.PodDisruptionBudgets,
-			"networkpolicies":          perms.NetworkPolicies,
-			"serviceaccounts":          perms.ServiceAccounts,
-			"limitranges":              perms.LimitRanges,
+		// scopes drives which informers are created and at what scope.
+		// k8score routes each kind through the matching factory (cluster-wide
+		// or namespace-scoped) based on these per-kind decisions.
+		scopes := permResult.Scopes
+		if scopes == nil {
+			scopes = map[string]k8score.ResourceScope{}
 		}
 
 		cfg := k8score.CacheConfig{
 			Client:              k8sClient,
-			ResourceTypes:       enabled,
+			ResourceScopes:      scopes,
 			DeferredTypes:       deferredResources,
-			NamespaceScoped:     permResult.NamespaceScoped,
-			Namespace:           permResult.Namespace,
 			DebugEvents:         DebugEvents,
 			TimingLogger:        logTiming,
 			PatienceWindow:      firstPaintPatience,
@@ -222,7 +204,7 @@ func InitResourceCache(ctx context.Context) error {
 
 		resourceCache = &ResourceCache{
 			ResourceCache:  core,
-			secretsEnabled: enabled["secrets"],
+			secretsEnabled: scopes["secrets"].Enabled,
 		}
 	})
 	return initErr

@@ -52,6 +52,12 @@ type PrometheusResetFunc func()
 // PrometheusReinitFunc is called to reinitialize the Prometheus metrics client
 type PrometheusReinitFunc func() error
 
+// LoadSavedNamespaceFunc is called to look up the user's last-saved
+// namespace override for a given context. Returns empty string if no
+// override is saved. Registered by the persistence layer (settings) so
+// k8s/ stays free of internal/settings imports.
+type LoadSavedNamespaceFunc func(contextName string) string
+
 var (
 	contextSwitchCallbacks         []ContextSwitchCallback
 	contextSwitchProgressCallbacks []ContextSwitchProgressCallback
@@ -64,6 +70,7 @@ var (
 	trafficReinitFunc              TrafficReinitFunc
 	prometheusResetFunc            PrometheusResetFunc
 	prometheusReinitFunc           PrometheusReinitFunc
+	loadSavedNamespaceFunc         LoadSavedNamespaceFunc
 
 	// operationCtx is canceled at the start of every context switch and retry.
 	// API calls that should not survive a context switch (RBAC checks, capability
@@ -167,6 +174,38 @@ func RegisterPrometheusFuncs(reset PrometheusResetFunc, reinit PrometheusReinitF
 	prometheusReinitFunc = reinit
 }
 
+// RegisterLoadSavedNamespaceFunc registers a hook that returns the user's
+// last-saved namespace override for a given context. Called before the
+// resource cache initializes so the probe phase uses the right namespace.
+func RegisterLoadSavedNamespaceFunc(fn LoadSavedNamespaceFunc) {
+	contextSwitchMu.Lock()
+	defer contextSwitchMu.Unlock()
+	loadSavedNamespaceFunc = fn
+}
+
+// applySavedNamespaceOverride looks up the user's saved namespace for the
+// current context and applies it, if any. No-op when no hook is registered
+// or no saved value exists. Called at boot and after every context switch
+// so the resource cache initializes with the user's intended scope.
+func applySavedNamespaceOverride() {
+	contextSwitchMu.RLock()
+	fn := loadSavedNamespaceFunc
+	contextSwitchMu.RUnlock()
+	if fn == nil {
+		return
+	}
+	ctxName := GetContextName()
+	if ctxName == "" {
+		return
+	}
+	saved := fn(ctxName)
+	if saved == "" {
+		return
+	}
+	log.Printf("[ops] Restoring saved namespace override for context %q: %q", ctxName, saved)
+	SetActiveNamespaceOverride(saved)
+}
+
 // TestClusterConnection tests connectivity to the current cluster.
 // Returns an error if the cluster is unreachable within the timeout.
 //
@@ -211,6 +250,72 @@ func TestClusterConnection(ctx context.Context) error {
 	}
 }
 
+// PerformNamespaceSwitch reinitializes the resource and dynamic caches against
+// a different namespace. Use cases: a namespace-scoped user (no cluster-wide
+// list) wants to look at a different namespace they have access to (k9s :ns),
+// or a cluster-wide user wants Radar to focus on a single namespace.
+//
+// Unlike PerformContextSwitch this does not touch the kubeconfig context,
+// k8s clients, Helm, or timeline — only the cached cluster view changes. The
+// override is also cleared on context switch since the saved namespace is
+// meaningless against a different cluster's namespace list.
+//
+// Pass an empty string to clear the override and fall back to the kubeconfig
+// context namespace (or no fallback when none is set).
+func PerformNamespaceSwitch(namespace string) error {
+	switchStart := time.Now()
+	prev := GetActiveNamespaceOverride()
+	if namespace == prev {
+		return nil
+	}
+	log.Printf("[ops] Namespace switch START %q → %q", prev, namespace)
+
+	// Cancel in-flight RBAC checks / probes from the previous namespace —
+	// otherwise stale results could land in the cache after the new probes.
+	CancelOngoingOperations()
+
+	// Tear down only the data layer. Clients, kubeconfig, Helm, timeline,
+	// traffic, and Prometheus all stay live — they are not namespace-scoped.
+	safeReset("dynamic resource cache", ResetDynamicResourceCache)
+	safeReset("resource discovery", ResetResourceDiscovery)
+	safeReset("resource cache", ResetResourceCache)
+
+	// Now flip the override and invalidate caches that depend on it.
+	SetActiveNamespaceOverride(namespace)
+	InvalidateCapabilitiesCache()
+	InvalidateResourcePermissionsCache()
+
+	// Re-probe + re-create informers under the new scope.
+	initCtx, cancel := NewOperationContext(ContextSwitchTimeout)
+	defer cancel()
+	if err := InitResourceCache(initCtx); err != nil {
+		log.Printf("[ops] Namespace switch FAILED at resource cache init: %v", err)
+		return fmt.Errorf("resource cache reinit failed: %w", err)
+	}
+	if err := InitResourceDiscovery(); err != nil {
+		log.Printf("Warning: resource discovery reinit failed: %v", err)
+	}
+	if cache := GetResourceCache(); cache != nil {
+		if err := InitDynamicResourceCache(cache.ChangesRaw()); err != nil {
+			log.Printf("Warning: dynamic resource cache reinit failed: %v", err)
+		}
+	}
+
+	log.Printf("[ops] Namespace switch to %q COMPLETE (%v total)", namespace, time.Since(switchStart))
+
+	// Reuse the context-switch callbacks so SSE/UI listeners refresh — for
+	// the consumer the effect is the same: cluster view changed, redraw.
+	contextSwitchMu.RLock()
+	callbacks := make([]ContextSwitchCallback, len(contextSwitchCallbacks))
+	copy(callbacks, contextSwitchCallbacks)
+	contextSwitchMu.RUnlock()
+	for _, callback := range callbacks {
+		callback(GetContextName())
+	}
+
+	return nil
+}
+
 // PerformContextSwitch orchestrates a full context switch:
 // 1. Tears down all subsystems
 // 2. Switches the K8s client to the new context
@@ -244,6 +349,11 @@ func PerformContextSwitch(newContext string) error {
 		return fmt.Errorf("failed to switch context: %w", err)
 	}
 	logTiming("   [ops] SwitchContext: %v", time.Since(t))
+
+	// Restore any saved namespace override for the new context. SwitchContext
+	// just cleared the previous context's override; the user may have a
+	// different one saved for this cluster.
+	applySavedNamespaceOverride()
 
 	// Invalidate caches - permissions and cluster info may differ between clusters
 	InvalidateCapabilitiesCache()

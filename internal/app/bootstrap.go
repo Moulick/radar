@@ -18,6 +18,7 @@ import (
 	mcppkg "github.com/skyhook-io/radar/internal/mcp"
 	prometheuspkg "github.com/skyhook-io/radar/internal/prometheus"
 	"github.com/skyhook-io/radar/internal/server"
+	"github.com/skyhook-io/radar/internal/settings"
 	"github.com/skyhook-io/radar/internal/static"
 	"github.com/skyhook-io/radar/internal/timeline"
 	"github.com/skyhook-io/radar/internal/traffic"
@@ -140,6 +141,17 @@ func RegisterCallbacks(cfg AppConfig, timelineStoreCfg timeline.StoreConfig) {
 			prometheuspkg.SetManualURL(cfg.PrometheusURL)
 		}
 		return nil
+	})
+
+	// Restore the user's last-saved namespace override before InitResourceCache
+	// runs. Loaded fresh from disk on each call (vs caching on boot) so a
+	// settings PUT in one process is reflected on the next context switch.
+	k8s.RegisterLoadSavedNamespaceFunc(func(contextName string) string {
+		s := settings.Load()
+		if s.ActiveNamespaces == nil {
+			return ""
+		}
+		return s.ActiveNamespaces[contextName]
 	})
 }
 

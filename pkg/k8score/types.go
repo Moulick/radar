@@ -81,6 +81,14 @@ type OwnerInfo struct {
 	Name string `json:"name"`
 }
 
+// ResourceScope describes the access scope for a single resource type.
+// An empty Namespace means cluster-wide access; a non-empty Namespace means
+// the informer is restricted to that namespace.
+type ResourceScope struct {
+	Enabled   bool   // false = no informer (denied or not requested)
+	Namespace string // empty = cluster-wide
+}
+
 // CacheConfig holds configuration for creating a ResourceCache.
 type CacheConfig struct {
 	// Client is the Kubernetes clientset used to create informers.
@@ -89,7 +97,22 @@ type CacheConfig struct {
 	// ResourceTypes lists the resource types to watch. Each key is a
 	// ResourceType constant (e.g., Pods, Services). Only types present
 	// in this map with a true value will have informers created.
+	//
+	// Combined with NamespaceScoped+Namespace this gives a single uniform
+	// scope for every enabled informer. For mixed scopes (some kinds
+	// cluster-wide, some namespace-scoped), use ResourceScopes instead.
 	ResourceTypes map[string]bool
+
+	// ResourceScopes optionally specifies per-kind enablement and scope.
+	// When non-nil this takes precedence over ResourceTypes,
+	// NamespaceScoped, and Namespace — each kind is enabled (or not) and
+	// scoped (cluster-wide or to a single namespace) independently.
+	//
+	// This exists so callers that probe access per kind (e.g. to handle
+	// users with cluster-wide permission for a few resources but only
+	// namespaced permission for the rest) can wire each informer to the
+	// scope it actually has, instead of falling back to all-or-nothing.
+	ResourceScopes map[string]ResourceScope
 
 	// DeferredTypes lists resource types whose informers sync in the
 	// background after critical informers complete. Their listers return

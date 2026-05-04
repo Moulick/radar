@@ -349,6 +349,11 @@ func (s *Server) setupRoutes() {
 			r.Get("/contexts", s.handleListContexts)
 			r.Post("/contexts/{name}", s.handleSwitchContext)
 
+			// Active namespace switcher (k9s :ns equivalent for the
+			// namespace-scoped path; informational filter for cluster-wide users)
+			r.Get("/cluster/namespace-scope", s.handleGetNamespaceScope)
+			r.Post("/cluster/namespace", s.handleSetActiveNamespace)
+
 			// CAPI routes
 			r.Get("/capi/clusters/{ns}/{name}/kubeconfig", s.handleCAPIClusterKubeconfig)
 			r.Post("/capi/clusters/{ns}/{name}/connect", s.handleCAPIClusterConnect)
@@ -721,7 +726,25 @@ func (s *Server) handleNamespaces(w http.ResponseWriter, r *http.Request) {
 
 	lister := cache.Namespaces()
 	if lister == nil {
-		s.writeError(w, http.StatusForbidden, "insufficient permissions to list namespaces")
+		// Cluster-wide Namespaces informer isn't available. Two cases:
+		//   - ns-scoped user: cluster-scoped kinds are intentionally disabled
+		//     when the cache is pinned to a single namespace; the user still
+		//     has a namespace they can see, so return that instead of 403.
+		//   - truly zero-perm user: GetAccessibleNamespaces returns empty,
+		//     and we 403 as before.
+		// Also dampens a UI race during namespace-switch teardown: the
+		// frontend re-fires useNamespaces() the instant scope flips, often
+		// hitting the moment when the new informer hasn't registered yet.
+		accessible, _ := k8s.GetAccessibleNamespaces(r.Context())
+		if len(accessible) == 0 {
+			s.writeError(w, http.StatusForbidden, "insufficient permissions to list namespaces")
+			return
+		}
+		result := make([]map[string]any, 0, len(accessible))
+		for _, name := range accessible {
+			result = append(result, map[string]any{"name": name, "status": "Active"})
+		}
+		s.writeJSON(w, result)
 		return
 	}
 
