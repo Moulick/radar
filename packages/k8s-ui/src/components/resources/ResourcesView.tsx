@@ -2487,7 +2487,10 @@ export function ResourcesView({
     const current = selectedResource ?? null
     const drawerSwitched =
       prev !== null && current !== null &&
-      (prev.namespace !== current.namespace || prev.name !== current.name || prev.kind !== current.kind)
+      (prev.namespace !== current.namespace ||
+        prev.name !== current.name ||
+        prev.kind !== current.kind ||
+        (prev.group ?? '') !== (current.group ?? ''))
     const pushHistory = shouldPushHistory.current || pathChanged || drawerSwitched
     shouldPushHistory.current = false
     prevSelectedResourceRef.current = current
