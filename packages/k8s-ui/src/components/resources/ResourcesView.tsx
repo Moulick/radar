@@ -2472,7 +2472,17 @@ export function ResourcesView({
     // (selectedResource A -> B, both non-null and different). Initial open (null -> X) and close (X -> null)
     // stay as replace because they don't represent a destination the user wants to "go back" to.
     const targetPath = `${basePath}/${selectedKind.name}`
-    const pathChanged = window.location.pathname !== targetPath
+    // Compare basename-relative paths. Hosts that mount the app under a non-empty basename
+    // (e.g. Radar Hub at /c/{cluster}) inject `locationPathname` from useLocation(), which strips
+    // the basename — `window.location.pathname` still includes it, so reading window directly
+    // would never match `targetPath` (basename-relative) and force every URL write to push.
+    const currentPath =
+      locationPathname !== undefined
+        ? locationPathname
+        : typeof window !== 'undefined'
+          ? window.location.pathname
+          : ''
+    const pathChanged = currentPath !== targetPath
     const prev = prevSelectedResourceRef.current
     const current = selectedResource ?? null
     const drawerSwitched =
@@ -2483,7 +2493,7 @@ export function ResourcesView({
     prevSelectedResourceRef.current = current
 
     updateURL(selectedKind, searchTerm, columnFilters, problemFilters, showInactiveReplicaSets, selectedResource?.namespace, selectedResource?.name, pushHistory)
-  }, [selectedKind, searchTerm, columnFilters, problemFilters, showInactiveReplicaSets, selectedResource, updateURL, basePath])
+  }, [selectedKind, searchTerm, columnFilters, problemFilters, showInactiveReplicaSets, selectedResource, updateURL, basePath, locationPathname])
 
   // Handle resource click from URL on mount
   useEffect(() => {
