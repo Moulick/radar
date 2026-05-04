@@ -52,7 +52,7 @@ export interface ClusterSwitcherProps {
 // pressure) show full cluster names rather than middle-truncating
 // pointlessly. The xl tier (~400px) fits names up to ~30 chars in
 // full — comfortably covering parsed cluster names from any provider.
-const TRIGGER_NAME_MAX_WIDTH = 'max-w-[160px] sm:max-w-[260px] xl:max-w-[400px]'
+const TRIGGER_NAME_MAX_WIDTH = 'max-w-[140px] sm:max-w-[220px] xl:max-w-[340px]'
 
 export function ClusterSwitcher({
   currentId,
@@ -175,8 +175,8 @@ export function ClusterSwitcher({
         onClick={() => setIsOpen(v => !v)}
         disabled={disabled || loading}
         className={`
-          flex items-center gap-1.5 px-2.5 py-1.5
-          bg-theme-elevated border border-theme-border rounded text-sm font-medium
+          flex items-center gap-1 px-2 py-1
+          bg-theme-elevated border border-theme-border rounded text-[13px] font-medium
           text-theme-text-primary hover:bg-theme-hover hover:border-theme-border-light
           transition-colors cursor-pointer
           disabled:opacity-50 disabled:cursor-not-allowed

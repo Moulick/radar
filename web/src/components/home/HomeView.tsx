@@ -9,6 +9,7 @@ import { TrafficSummary } from './TrafficSummary'
 import { CertificateHealthCard } from './CertificateHealthCard'
 import { NetworkPolicyCoverageCard } from './NetworkPolicyCoverageCard'
 import { CostCard } from './CostCard'
+import { GitOpsControllersCard } from './GitOpsControllersCard'
 import { AuditCard, PaneLoader, StatusDot, mapHealthToTone } from '@skyhook-io/k8s-ui'
 import { ClusterHealthCard } from './ClusterHealthCard'
 import { AlertTriangle, Shield } from 'lucide-react'
@@ -108,7 +109,7 @@ export function HomeView({ namespaces, topology, onNavigateToView, onNavigateToR
             </div>
 
             {/* Health & compliance cards — 3-col when enough cards, 2-col fallback */}
-            {(data.certificateHealth || data.networkPolicyCoverage || data.audit) && (() => {
+            {(data.certificateHealth || data.networkPolicyCoverage || data.audit || data.gitopsControllers) && (() => {
               const healthCards = [
                 data.certificateHealth && (
                   <CertificateHealthCard
@@ -122,6 +123,13 @@ export function HomeView({ namespaces, topology, onNavigateToView, onNavigateToR
                     key="netpol"
                     data={data.networkPolicyCoverage}
                     onNavigate={() => onNavigateToResourceKind('networkpolicies', 'networking.k8s.io')}
+                  />
+                ),
+                data.gitopsControllers && (
+                  <GitOpsControllersCard
+                    key="gitops-controllers"
+                    data={data.gitopsControllers}
+                    onNavigate={() => onNavigateToView('gitops')}
                   />
                 ),
                 data.audit && (
