@@ -329,6 +329,9 @@ export interface ContextInfo {
   user: string
   namespace: string
   isCurrent: boolean
+  /** Source kubeconfig label (e.g. "kube-cluster-paris"). Set by backend
+   *  only when 2+ kubeconfig files are loaded; empty otherwise. */
+  source?: string
 }
 
 // Namespace
