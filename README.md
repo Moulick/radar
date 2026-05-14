@@ -235,14 +235,20 @@ View TLS certificate details and expiry dates across all namespaces — catch ex
 
 ### GitOps
 
-Monitor and manage FluxCD and ArgoCD resources with unified status views and actions.
+Monitor, diagnose, and manage FluxCD and ArgoCD resources from a dedicated GitOps workspace.
 
-- **FluxCD**: GitRepository, OCIRepository, HelmRepository, Kustomization, HelmRelease, Alert
-- **ArgoCD**: Application, ApplicationSet, AppProject
-- Real-time sync status, health indicators, and reconciliation countdowns
-- Trigger reconciliation, suspend/resume resources, and view managed resource inventory
-- Problem detection with clear alerts for degraded or out-of-sync resources
-- **Note**: Topology connections between GitOps resources and managed workloads only appear when both are in the same cluster. FluxCD typically deploys to its own cluster. ArgoCD often manages remote clusters — connect Radar to the target cluster to see workloads, or to the ArgoCD cluster to see Application status.
+<p align="center">
+  <img src="docs/screenshots/gitops-view.png" alt="GitOps fleet view" width="800">
+  <br><em>GitOps fleet view — Argo + Flux applications side-by-side with sync, health, source, destination, and lifecycle state</em>
+</p>
+
+- Fleet view + per-app detail page (Topology / Changes / Activity tabs) for **ArgoCD** (`Application`, `ApplicationSet`, `AppProject`) and **FluxCD** (`GitRepository`, `OCIRepository`, `HelmRepository`, `Bucket`, `Kustomization`, `HelmRelease`, `Alert`)
+- **Diagnosis pipeline** — field-level drift, recent events per resource, stuck-drift-loop detection, parsed operation-failures, structured one-click remediation
+- **Lifecycle awareness** — `Terminating` chip replaces stale Sync/Health badges; severity ramps with deletion age; mutating ops refuse on zombies
+- **Cross-linked from the rest of Radar** — `Managed by` chip in resource drawers, GitOps routing from Topology + Timeline + Helm view, `Consumed by` panel on Flux source CRs
+- **MCP integration** — `manage_gitops` exposes sync / suspend / resume / reconcile / rollback with lifecycle-aware refusal
+
+See the [GitOps guide](docs/gitops.md) for the full feature matrix, RBAC requirements, demo cluster, and single-cluster scope notes.
 
 ### Traffic
 

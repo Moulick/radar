@@ -2,6 +2,7 @@ package k8s
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -715,9 +716,9 @@ func (c *ResourceCache) ListDynamicWithGroup(ctx context.Context, kind string, n
 
 	if !ok {
 		if group != "" {
-			return nil, fmt.Errorf("unknown resource kind: %s (group: %s)", kind, group)
+			return nil, fmt.Errorf("%w: %s (group: %s)", ErrUnknownDynamicKind, kind, group)
 		}
-		return nil, fmt.Errorf("unknown resource kind: %s", kind)
+		return nil, fmt.Errorf("%w: %s", ErrUnknownDynamicKind, kind)
 	}
 
 	dynamicCache := GetDynamicResourceCache()
@@ -728,6 +729,12 @@ func (c *ResourceCache) ListDynamicWithGroup(ctx context.Context, kind string, n
 	return dynamicCache.List(gvr, namespace)
 }
 
+// ErrUnknownDynamicKind is returned by ListDynamic / GetDynamicWithGroup when
+// the requested kind has no registered GVR in API discovery. Wrapped with
+// fmt.Errorf("%w: ..."), so callers should match with errors.Is. The HTTP
+// layer translates this to 400 Bad Request.
+var ErrUnknownDynamicKind = errors.New("unknown resource kind")
+
 // GetDynamic returns a single resource of any type using the dynamic cache
 func (c *ResourceCache) GetDynamic(ctx context.Context, kind string, namespace string, name string) (*unstructured.Unstructured, error) {
 	return c.GetDynamicWithGroup(ctx, kind, namespace, name, "")
@@ -735,6 +742,17 @@ func (c *ResourceCache) GetDynamic(ctx context.Context, kind string, namespace s
 
 // GetDynamicWithGroup returns a single resource, using the group to disambiguate
 func (c *ResourceCache) GetDynamicWithGroup(ctx context.Context, kind string, namespace string, name string, group string) (*unstructured.Unstructured, error) {
+	return c.getDynamicWithGroup(ctx, kind, namespace, name, group, false)
+}
+
+// GetDynamicWithGroupPreserveLastApplied returns a single resource while
+// preserving kubectl last-applied for internal drift computation. Do not use
+// for API/UI/MCP responses.
+func (c *ResourceCache) GetDynamicWithGroupPreserveLastApplied(ctx context.Context, kind string, namespace string, name string, group string) (*unstructured.Unstructured, error) {
+	return c.getDynamicWithGroup(ctx, kind, namespace, name, group, true)
+}
+
+func (c *ResourceCache) getDynamicWithGroup(ctx context.Context, kind string, namespace string, name string, group string, preserveLastApplied bool) (*unstructured.Unstructured, error) {
 	discovery := GetResourceDiscovery()
 	if discovery == nil {
 		return nil, fmt.Errorf("resource discovery not initialized")
@@ -751,9 +769,9 @@ func (c *ResourceCache) GetDynamicWithGroup(ctx context.Context, kind string, na
 
 	if !ok {
 		if group != "" {
-			return nil, fmt.Errorf("unknown resource kind: %s (group: %s)", kind, group)
+			return nil, fmt.Errorf("%w: %s (group: %s)", ErrUnknownDynamicKind, kind, group)
 		}
-		return nil, fmt.Errorf("unknown resource kind: %s", kind)
+		return nil, fmt.Errorf("%w: %s", ErrUnknownDynamicKind, kind)
 	}
 
 	dynamicCache := GetDynamicResourceCache()
@@ -765,10 +783,19 @@ func (c *ResourceCache) GetDynamicWithGroup(ctx context.Context, kind string, na
 	// the dynamic cache strips to save memory. Bypass the cache on single-CRD
 	// fetches so the YAML tab and MCP get_resource see the full object; list
 	// views (which don't render schemas) still go through the cache.
+	//
+	// preserveLastApplied also goes via direct GET. The cached path would
+	// otherwise force-start a dynamic informer for the resource's GVR — fine
+	// for CRDs but a memory regression for core kinds (apps/Deployment,
+	// /v1/Service, etc.) that Argo's status.resources commonly references,
+	// since the informer would retain last-applied across every object
+	// cluster-wide just to power a per-page-load drift diff.
 	var u *unstructured.Unstructured
 	var err error
 	if gvr.Group == "apiextensions.k8s.io" && gvr.Resource == "customresourcedefinitions" {
 		u, err = dynamicCache.GetDirect(ctx, gvr, namespace, name)
+	} else if preserveLastApplied {
+		u, err = dynamicCache.GetDirectPreserveLastApplied(ctx, gvr, namespace, name)
 	} else {
 		u, err = dynamicCache.Get(gvr, namespace, name)
 	}

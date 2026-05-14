@@ -23,6 +23,8 @@ import type {
   InstallChartRequest,
   ArtifactHubSearchResult,
   ArtifactHubChartDetail,
+  GitOpsResourceTree,
+  GitOpsInsight,
 } from '../types'
 import type { GitOpsOperationResponse } from '../types/gitops'
 import { getApiBase, getAuthHeaders, getCredentialsMode, getBasename, routePath } from './config'
@@ -256,6 +258,31 @@ export interface DashboardNetworkPolicyCoverage {
   totalWorkloads: number
 }
 
+export interface DashboardGitOpsControllers {
+  // Aggregate roll-up across all detected controllers.
+  status: 'healthy' | 'degraded' | 'crashing'
+  controllers: DashboardGitOpsController[]
+}
+
+export interface DashboardGitOpsController {
+  name: string
+  // Tool vocabulary aligns with the backend `ctrlTool*` constants in
+  // internal/server/dashboard_gitops.go and the GitOps tree-builder
+  // tags in pkg/gitops/tree/graph.go (`gitopsTool`). Keep these three
+  // surfaces in sync — diverging vocabulary across surfaces was a real
+  // source of confusion until consolidated.
+  tool: 'argocd' | 'fluxcd'
+  namespace: string
+  ready: number
+  total: number
+  // Per-controller status (aggregate is in the parent and excludes
+  // 'pending' — it normalizes into 'degraded' there).
+  status: 'healthy' | 'degraded' | 'crashing' | 'pending'
+  // Reason for the crash when status === 'crashing'. Common values:
+  // "CrashLoopBackOff", "Error". Empty for non-crashing states.
+  crashReason?: string
+}
+
 export interface DashboardResponse {
   cluster: DashboardCluster
   health: DashboardHealth
@@ -270,6 +297,7 @@ export interface DashboardResponse {
   certificateHealth: DashboardCertificateHealth | null
   networkPolicyCoverage: DashboardNetworkPolicyCoverage | null
   audit: DashboardAudit | null
+  gitopsControllers: DashboardGitOpsControllers | null
   nodeVersionSkew: { versions: Record<string, string[]>; minVersion: string; maxVersion: string } | null
   deferredLoading?: boolean // True while deferred informers (secrets, events, etc.) are still syncing
   partialData?: string[] // Critical kinds promoted at first paint that haven't yet finished syncing (live-filtered)
@@ -780,6 +808,46 @@ export function useTopology(namespaces: string[], viewMode: string = 'resources'
     queryFn: () => fetchJSON(`/topology${queryString ? `?${queryString}` : ''}`),
     staleTime: 5000, // 5 seconds
     enabled: options?.enabled !== false,
+  })
+}
+
+export function useGitOpsTree(kind: string, namespace: string, name: string, group?: string, namespaces: string[] = []) {
+  const ns = namespace || '_'
+  const params = new URLSearchParams()
+  if (group) params.set('group', group)
+  if (namespaces.length > 0) params.set('namespaces', namespaces.join(','))
+  const queryString = params.toString()
+
+  return useQuery<GitOpsResourceTree>({
+    queryKey: ['gitops-tree', kind, namespace, name, group, namespaces],
+    queryFn: () => fetchJSON(`/gitops/tree/${kind}/${ns}/${name}${queryString ? `?${queryString}` : ''}`),
+    enabled: Boolean(kind && name),
+    staleTime: 5000,
+  })
+}
+
+// Poll fast (2s) while a sync/rollback is in flight so the user sees the
+// outcome quickly; otherwise rely on staleTime + manual refetch. Argo flips
+// operationState.phase from "Running" -> Succeeded/Failed when done, so this
+// auto-quiesces on completion.
+const INSIGHTS_RUNNING_POLL_MS = 2000
+
+export function useGitOpsInsights(kind: string, namespace: string, name: string, group?: string, namespaces: string[] = []) {
+  const ns = namespace || '_'
+  const params = new URLSearchParams()
+  if (group) params.set('group', group)
+  if (namespaces.length > 0) params.set('namespaces', namespaces.join(','))
+  const queryString = params.toString()
+
+  return useQuery<GitOpsInsight>({
+    queryKey: ['gitops-insights', kind, namespace, name, group, namespaces],
+    queryFn: () => fetchJSON(`/gitops/insights/${kind}/${ns}/${name}${queryString ? `?${queryString}` : ''}`),
+    enabled: Boolean(kind && name),
+    staleTime: 5000,
+    refetchInterval: (query) => {
+      const phase = query.state.data?.summary?.operationPhase
+      return phase === 'Running' ? INSIGHTS_RUNNING_POLL_MS : false
+    },
   })
 }
 
@@ -2232,6 +2300,7 @@ export function useArtifactHubChart(repoName: string, chartName: string, version
 
 interface GitOpsMutationConfig<TVariables> {
   getPath: (variables: TVariables) => string
+  getBody?: (variables: TVariables) => unknown
   errorMessage: string
   successMessage: string
   getInvalidateKeys: (variables: TVariables) => (string | undefined)[][]
@@ -2248,6 +2317,8 @@ function createGitOpsMutation<TVariables>(config: GitOpsMutationConfig<TVariable
       mutationFn: async (variables: TVariables): Promise<GitOpsOperationResponse> => {
         const response = await apiFetch(`${getApiBase()}${config.getPath(variables)}`, {
           method: 'POST',
+          headers: config.getBody ? { 'Content-Type': 'application/json' } : undefined,
+          body: config.getBody ? JSON.stringify(config.getBody(variables)) : undefined,
         })
         if (!response.ok) {
           const error = await response.json().catch(() => ({ error: 'Unknown error' }))
@@ -2270,16 +2341,46 @@ function createGitOpsMutation<TVariables>(config: GitOpsMutationConfig<TVariable
 
 // Common variable types
 type FluxResourceVars = { kind: string; namespace: string; name: string }
+// ArgoAppVars identifies the target Application. Used by mutations that don't
+// take a body (terminate, suspend, resume, refresh).
 type ArgoAppVars = { namespace: string; name: string }
+// ArgoSyncVars extends ArgoAppVars with the sync request body fields. Only
+// useArgoSync sends these — splitting the type prevents callers from passing
+// resources/revision/prune to mutations that would silently drop them.
+type ArgoSyncVars = ArgoAppVars & {
+  resources?: Array<{ group?: string; kind: string; namespace?: string; name: string }>
+  revision?: string
+  prune?: boolean
+  dryRun?: boolean
+  force?: boolean
+  applyOnly?: boolean
+  // Free-form Argo SyncOption strings, e.g. "Replace=true",
+  // "ServerSideApply=true", "PruneLast=true". Caller is responsible for
+  // spelling.
+  syncOptions?: string[]
+}
+
+// ArgoRollbackVars targets a specific Argo history entry by ID. Prune and
+// DryRun mirror the sync flags so the rollback dialog can offer the same
+// safety net.
+type ArgoRollbackVars = ArgoAppVars & {
+  id: number
+  prune?: boolean
+  dryRun?: boolean
+}
 
 // Standard invalidation patterns
 const fluxInvalidateKeys = (v: FluxResourceVars) => [
   ['resources', v.kind],
   ['resource', v.kind, v.namespace, v.name],
+  ['gitops-tree', v.kind, v.namespace, v.name],
+  ['gitops-insights', v.kind, v.namespace, v.name],
 ]
 const argoInvalidateKeys = (v: ArgoAppVars) => [
   ['resources', 'applications'],
   ['resource', 'applications', v.namespace, v.name],
+  ['gitops-tree', 'applications', v.namespace, v.name],
+  ['gitops-insights', 'applications', v.namespace, v.name],
 ]
 
 // ============================================================================
@@ -2324,10 +2425,27 @@ export const useFluxSyncWithSource = createGitOpsMutation<FluxResourceVars>({
 // ArgoCD API hooks
 // ============================================================================
 
-export const useArgoSync = createGitOpsMutation<ArgoAppVars>({
+export const useArgoSync = createGitOpsMutation<ArgoSyncVars>({
   getPath: (v) => `/argo/applications/${v.namespace}/${v.name}/sync`,
+  getBody: (v) => ({
+    resources: v.resources,
+    revision: v.revision,
+    prune: v.prune,
+    dryRun: v.dryRun,
+    force: v.force,
+    applyOnly: v.applyOnly,
+    syncOptions: v.syncOptions,
+  }),
   errorMessage: 'Failed to trigger sync',
   successMessage: 'Sync initiated',
+  getInvalidateKeys: argoInvalidateKeys,
+})
+
+export const useArgoRollback = createGitOpsMutation<ArgoRollbackVars>({
+  getPath: (v) => `/argo/applications/${v.namespace}/${v.name}/rollback`,
+  getBody: (v) => ({ id: v.id, prune: v.prune, dryRun: v.dryRun }),
+  errorMessage: 'Failed to roll back application',
+  successMessage: 'Rollback initiated',
   getInvalidateKeys: argoInvalidateKeys,
 })
 
@@ -2373,8 +2491,13 @@ export function useArgoRefresh() {
       successMessage: 'Application refreshed',
     },
     onSuccess: (_, variables) => {
-      queryClient.invalidateQueries({ queryKey: ['resources', 'applications'] })
-      queryClient.invalidateQueries({ queryKey: ['resource', 'applications', variables.namespace, variables.name] })
+      // Match the standard Argo invalidation set so the GitOps detail page
+      // (insights strip, resource tree) refetches after Refresh / Hard
+      // Refresh — without these two extra keys the user clicks Refresh and
+      // sees stale insight/tree data until the next staleTime tick.
+      argoInvalidateKeys(variables).forEach((key) =>
+        queryClient.invalidateQueries({ queryKey: key })
+      )
     },
   })
 }

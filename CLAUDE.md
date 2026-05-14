@@ -143,8 +143,9 @@ radar/
 │   │   ├── portforward.go     # Port forwarding sessions
 │   │   ├── resource_counts.go # Resource counting
 │   │   ├── dashboard.go       # Dashboard summary endpoint
-│   │   ├── argo_handlers.go   # ArgoCD sync/refresh/suspend handlers
-│   │   ├── flux_handlers.go   # FluxCD reconcile/suspend handlers
+│   │   ├── argo_handlers.go   # ArgoCD sync/refresh/terminate/suspend/resume/rollback/selective-sync handlers
+│   │   ├── flux_handlers.go   # FluxCD reconcile/suspend/resume/sync-with-source handlers
+│   │   ├── gitops_handlers.go # /api/gitops/tree + /api/gitops/insights handlers, insightsResolver wiring
 │   │   ├── gitops_types.go    # Shared GitOps request/response types
 │   │   ├── ai_handlers.go     # AI resource preview endpoints
 │   │   └── traffic_handlers.go # Service mesh traffic flow handlers
@@ -158,12 +159,15 @@ radar/
 │   │   └── context/           # AI context minification for LLM-friendly output
 │   ├── audit/                 # Shared cluster audit check engine (reusable by skyhook-connector)
 │   ├── gitops/                # GitOps operations abstraction
+│   │   ├── insights/          # Per-app diagnosis pipeline: issues + drift diff + recent events + plan + history
+│   │   └── tree/              # GitOps resource tree builder for ArgoCD/FluxCD detail graphs
 │   ├── k8score/               # Shared K8s caching layer (informers, listers, transforms)
 │   ├── portforward/           # Port forwarding logic
 │   ├── timeline/              # Timeline event storage (memory/SQLite)
 │   └── topology/
 │       ├── builder.go         # Topology graph construction
 │       ├── certificates.go    # Certificate relationship detection
+│       ├── memo.go            # 5s-TTL Memoizer wrapping deterministic Topology builds (used by GitOps handlers)
 │       ├── pod_grouping.go    # Pod grouping/collapsing logic
 │       ├── relationships.go   # Resource relationship detection
 │       └── types.go           # Node, edge, topology definitions
@@ -174,7 +178,7 @@ radar/
 │           │   ├── audit/      # AuditCard, AuditAlerts, AuditFindingsTable (shared)
 │           │   ├── resources/  # ResourcesView, resource-utils, renderers
 │           │   ├── shared/     # ResourceRendererDispatch, ResourceActionsBar, EditableYamlView
-│           │   ├── gitops/     # ArgoCD/FluxCD panels
+│           │   ├── gitops/     # ArgoCD/FluxCD shared status badges, action buttons, tree graph (GitOpsTreeGraph), insights views (GitOpsStatusStrip, GitOpsIssuesBand, GitOpsFailureCard, GitOpsChangesView with inline drift+events expand, GitOpsActivityInsightView)
 │           │   ├── workload/   # WorkloadView
 │           │   ├── timeline/   # Timeline shared components
 │           │   ├── logs/       # Log viewer core
@@ -187,7 +191,7 @@ radar/
 │   │   ├── api/               # API client + SSE hooks
 │   │   ├── components/
 │   │   │   ├── dock/          # Bottom dock with terminal/logs tabs
-│   │   │   ├── gitops/        # ArgoCD/FluxCD management panels
+│   │   │   ├── gitops/        # GitOps workspace: table+tile views, filters, app detail (Topology/Changes/Activity tabs), SyncOptionsDialog, RollbackDialog
 │   │   │   ├── helm/          # Helm release management UI
 │   │   │   ├── home/          # Home/dashboard view
 │   │   │   ├── logs/          # Logs viewer component
@@ -297,6 +301,8 @@ source .playwright-mcp/visual-test-state.env # Load $RADAR_URL, $SCREENSHOT_DIR,
 ```
 Use `/visual-test` command for the full workflow (cluster check, Playwright MCP, screenshots, report). Screenshots go under `.playwright-mcp/visual-test/`.
 
+**GitOps demo cluster** (`scripts/gitops-demo.sh` + `make gitops-demo`): bootstraps a `kind` cluster pre-loaded with Argo CD + Flux + a curated set of fixtures (healthy + suspended + manual-sync + ApplicationSet → 3 children + Flux Kustomization with dependsOn chain + HelmRelease) for visual-testing GitOps UI changes against realistic state. Coverage matrix in `scripts/gitops-demo/README.md`. When evaluating GitOps UI changes, run `make gitops-demo` and `kubectl config use-context kind-radar-gitops-demo` before `./scripts/visual-test-start.sh` — otherwise you're testing against whatever cluster is in the current context (often a customer/EKS cluster lacking the variety needed). `make gitops-demo-drift` induces a live OutOfSync state on guestbook for testing drift rendering.
+
 **Before calling a feature done — consider visual-test.** When you wrap up work that touches what the user actually sees (layout, copy, motion, color, theming, loading / empty / error states, modals, navigation, new pages, anything that changed how a screen reads), it's worth pausing to ask whether `/visual-test` would add value. `make tsc` + `make test` verify code correctness; `/visual-test` complements them by checking *feature* correctness — that the screen renders, behaves under interaction, and doesn't obviously regress neighboring surfaces. Not every UI change warrants one; this is a nudge to consider, not a hard rule.
 
 - **Run it yourself** when the change is self-contained and you can predict what the test should assert ("the new audit-finding card should show a severity badge and an expand affordance; clicking expands"). Cheap, catches obvious breakage.
@@ -318,7 +324,8 @@ If a UI change feels worth checking, mention it when you wrap up — even just f
 - MCP: `/mcp` (Streamable HTTP — POST for JSON-RPC, GET for SSE)
 - Helm: `/api/helm/releases/...`
 - Workloads: `/api/workloads/{kind}/{ns}/{name}/...` (logs, restart, scale, rollback)
-- GitOps: `/api/argo/applications/...`, `/api/flux/{kind}/...`
+- GitOps controller actions: `/api/argo/applications/...` (sync, refresh, terminate, suspend, resume, rollback, selective-sync), `/api/flux/{kind}/...` (reconcile, suspend, resume, sync-with-source)
+- GitOps detail data: `/api/gitops/tree/{kind}/{ns}/{name}` (resource tree + ownership edges), `/api/gitops/insights/{kind}/{ns}/{name}` (curated diagnosis: summary + issues + drift + events + plan + history + capabilities)
 - Nodes: `/api/nodes/{name}/...` (cordon, uncordon, drain, debug)
 - Audit: `/api/audit`, `/api/audit/resource/{kind}/{ns}/{name}`, `/api/settings/audit` (GET/PUT)
 - CAPI: `/api/capi/clusters/{ns}/{name}/kubeconfig` (GET), `/api/capi/clusters/{ns}/{name}/connect` (POST)
@@ -354,58 +361,21 @@ If a UI change feels worth checking, mention it when you wrap up — even just f
 - TTY, stdin, stdout, stderr support
 
 ### Topology Builder
-- Constructs directed graph from K8s resources
-- Owner reference traversal for parent-child relationships
-- Selector-based matching for Service→Pod, Deployment→ReplicaSet
-- Two view modes:
-  - `traffic`: Network flow (Ingress/Gateway → HTTPRoute → Service → Pod, also IstioGateway → VirtualService → Service, also IngressRoute → TraefikService → Service)
-  - `resources`: Full hierarchy (Deployment → ReplicaSet → Pod)
-- Node types: Internet, Ingress, Gateway, GatewayClass, HTTPRoute, GRPCRoute, TCPRoute, TLSRoute, Service, Deployment, DaemonSet, StatefulSet, ReplicaSet, Pod, Job, CronJob, ConfigMap, Secret, HorizontalPodAutoscaler, PersistentVolumeClaim, PersistentVolume, StorageClass, PodDisruptionBudget, VerticalPodAutoscaler, Rollout (Argo), Node, Namespace, NodePool, NodeClaim, NodeClass (Karpenter), ScaledObject, ScaledJob (KEDA), NetworkPolicy, CiliumNetworkPolicy, CiliumClusterwideNetworkPolicy, CAPICluster (Cluster API), MachineDeployment, MachineSet, Machine, MachinePool, KubeadmControlPlane, ClusterClass, MachineHealthCheck
-- Edge type semantics (these drive UI grouping in Related Resources): `EdgeManages` (owner), `EdgeUses` (autoscalers like HPA/VPA/KEDA → Scalers group), `EdgeProtects` (PDB/NetworkPolicy/CiliumNetworkPolicy → Policies group), `EdgeConfigures` (ConfigMap/Secret/DestinationRule), `EdgeExposes` (Service/Ingress/Gateway/VirtualService). Choose the right edge type — don't reuse one just because the code pattern is similar.
-- Istio service mesh nodes: VirtualService, DestinationRule, IstioGateway (note: uses "istiogateway" node ID prefix to disambiguate from Gateway API's "gateway")
-  - VirtualService → Service edges (EdgeExposes, via spec.http/tcp/tls route destinations, parses short/FQDN Istio host format)
-  - Istio Gateway → VirtualService edges (EdgeExposes, via spec.gateways[] references)
-  - DestinationRule → Service edges (EdgeConfigures, via spec.host)
-  - Uses `GetGVRWithGroup("Gateway", "networking.istio.io")` to disambiguate Istio Gateway from Gateway API Gateway
-  - Frontend detects Istio vs Gateway API Gateways via `data.apiVersion?.includes('networking.istio.io')`
-- Knative nodes: KnativeService, KnativeConfiguration, KnativeRevision, KnativeRoute (Serving); Broker, Trigger, PingSource, ApiServerSource, ContainerSource, SinkBinding (Eventing/Sources)
-  - Uses "knativeservice/" node ID prefix to disambiguate from core K8s Service; similarly "knativeingress/", "knativecertificate/"
-  - Uses `GetGVRWithGroup("Service", "serving.knative.dev")` for collision-prone kinds (Service, Ingress, Certificate, Configuration, Route, Broker, Channel)
-  - Serving edges: Route → Revision (EdgeExposes, via spec.traffic[].revisionName), Configuration/Revision owner-ref edges
-  - Eventing edges: Trigger → Broker (EdgeExposes), Trigger → subscriber (EdgeExposes), Sources → sink (EdgeExposes)
-  - Frontend detects Knative vs core kinds via `data.apiVersion?.includes('serving.knative.dev')` etc.
-- Traefik nodes: IngressRoute, IngressRouteTCP, IngressRouteUDP, Middleware, MiddlewareTCP, TraefikService, ServersTransport, ServersTransportTCP, TLSOption, TLSStore
-  - Node IDs use lowercase singular: `ingressroute/{ns}/{name}`, `middleware/{ns}/{name}`, etc.
-  - IngressRoute → Service edges (EdgeExposes, via spec.routes[].services[])
-  - IngressRoute → Middleware edges (EdgeConfigures, via spec.routes[].middlewares[])
-  - IngressRoute → TraefikService edges (EdgeExposes, when service kind is "TraefikService")
-  - TraefikService → Service edges (EdgeExposes, via spec.weighted/mirroring/highestRandomWeight services)
-  - TraefikService → TraefikService edges (EdgeExposes, for recursive references)
-  - Middleware chain → Middleware edges (EdgeConfigures, via spec.chain.middlewares[])
-  - ServersTransport/ServersTransportTCP → Secret edges (EdgeConfigures, via spec.rootCAsSecrets[] and spec.certificatesSecrets[])
-  - TLSOption → Secret edges (EdgeConfigures, via spec.clientAuth.secretNames[])
-  - TLSStore → Secret edges (EdgeConfigures, via spec.defaultCertificate.secretName)
-  - IngressRoute → ServersTransport edges (EdgeConfigures, via service serversTransport field)
-  - IngressRoute → TLSOption/TLSStore edges (EdgeConfigures, via spec.tls.options/store)
-  - Traffic view uses two-phase processing for TraefikService (Phase 1: nodes + ID map, Phase 2: edges) to handle forward references
-  - Kubernetes informers strip kind/apiVersion from cached objects — use stored prefix from `def.prefix` for ServersTransport lookups, not `GetKind()`
-- Cluster API (CAPI) nodes: CAPICluster, MachineDeployment, MachineSet, Machine, MachinePool, KubeadmControlPlane, ClusterClass, MachineHealthCheck
-  - Uses "capicluster/" node ID prefix to disambiguate from CNPG's Cluster (postgresql.cnpg.io)
-  - Uses `GetGVRWithGroup("Cluster", "cluster.x-k8s.io")` for collision-prone kinds (Cluster, Machine, MachineSet)
-  - Cluster → KCP edges (EdgeManages, via ownerRef on KCP)
-  - Cluster → MachineDeployment/MachinePool edges (EdgeManages, via ownerRef)
-  - MachineDeployment → MachineSet → Machine chain (EdgeManages, via ownerRef)
-  - KubeadmControlPlane → Machine edges (EdgeManages, via ownerRef)
-  - Machine → Node edges (EdgeManages, via status.nodeRef.name — semantic, not owner-ref)
-  - ClusterClass → Cluster edges (EdgeConfigures, via spec.topology.class match)
-  - MachineHealthCheck → Cluster edges (EdgeProtects, via ownerRef)
-  - v1beta1/v1beta2 dual support: status extractors check status.v1beta2.conditions then fall back to status.conditions
-  - Frontend detects CAPI vs CNPG clusters via `data?.apiVersion?.includes('cluster.x-k8s.io')`
-  - Topology-controlled badge: resources with label `topology.cluster.x-k8s.io/owned` show a warning banner
+- Constructs directed graph from K8s resources via owner references + selector matching
+- Two view modes: `traffic` (network flow: Ingress/Gateway → HTTPRoute → Service → Pod) and `resources` (hierarchy: Deployment → ReplicaSet → Pod)
+- **Edge type semantics** (drive UI grouping): `EdgeManages` (owner), `EdgeUses` (HPA/VPA/KEDA), `EdgeProtects` (PDB/NetworkPolicy), `EdgeConfigures` (ConfigMap/Secret/DestinationRule), `EdgeExposes` (Service/Ingress/Gateway). Choose the right type — don't reuse.
+- **CRD collision pattern**: When a CRD kind collides with core K8s (e.g., Knative Service, CAPI Cluster), use `GetGVRWithGroup("Kind", "group")` and prefix node IDs (`knativeservice/`, `capicluster/`). Frontend disambiguates via `data?.apiVersion?.includes('group.name')`.
+- Supported integrations: Core K8s, Gateway API, Istio, Knative, Traefik, Contour, CAPI, Karpenter, KEDA, cert-manager, GitOps (Argo/Flux). See `docs/integrations.md` for full list.
 - GitOps nodes: Application (ArgoCD), Kustomization, HelmRelease, GitRepository (FluxCD)
-  - Connected to managed resources via status.resources (ArgoCD) or status.inventory (FluxCD Kustomization)
-  - HelmRelease connects to resources via FluxCD labels (`helm.toolkit.fluxcd.io/name`) or standard Helm label (`app.kubernetes.io/instance`). Matches Deployment, Service, StatefulSet, DaemonSet, Job, CronJob, Rollout.
-  - **Single-cluster limitation**: Radar only shows connections when GitOps controller and managed resources are in the same cluster. ArgoCD commonly deploys to remote clusters (hub-spoke model), so Application→resource edges won't appear when connected to the ArgoCD cluster. FluxCD typically deploys to its own cluster, so connections usually work.
+  - `/api/gitops/tree/{kind}/{namespace}/{name}` — resource tree (managed resources + ownership edges)
+  - `/api/gitops/insights/{kind}/{namespace}/{name}` — curated diagnosis (summary, issues, drift, events, plan, history, capabilities)
+  - **Detail page structure**: 3 top-level tabs (Topology, Changes, Activity). Graph nodes for GitOps CRDs route to nested detail pages; ordinary K8s resources open the standard drawer.
+  - **Operations**: Argo: Sync (with options dialog), Refresh, Terminate, Suspend/Resume, Rollback, Selective sync. Flux: Reconcile, Suspend/Resume, Reconcile-with-source. Sentinel errors (`ErrOperationInProgress`, `ErrResourceTerminating`) mapped via `errors.Is` at HTTP layer.
+  - **Lifecycle (Terminating)**: `assertNotTerminating` pre-flight on all mutating operations. Frontend suppresses Sync/Health badges, disables action buttons, renders orange `[Terminating]` chip. Lifecycle Issue severity ramps by deletion age (info <5min, warning 5-30min, alert >30min). Cluster Audit `stuckTerminating` check uses same thresholds. Finalizer catalog (`pkg/gitops/insights/finalizers.go`) enriches lifecycle Issues with controller-health attribution.
+  - **Nested navigation**: `classifyGitOpsKind` tags nodes with `data.gitopsTool` + `data.gitopsKind`. Portal nodes route to child detail pages; lineage breadcrumb (`?from=kind|ns|name`) enables back navigation.
+  - **Severity vocabulary**: `critical` (0, red) → `alert` (1, orange) → `warning` (2, amber) → `info` (3, blue). Adding a new severity requires updating both Go `severityRank` and TS union in `gitops-insights.ts`.
+  - **Single-cluster limitation**: Application↔resource edges only render when controller + workloads are in same cluster (ArgoCD hub-spoke deployments won't show connections).
+  - **Per-resource drift**: computed from `kubectl.kubernetes.io/last-applied-configuration` annotation. SSA/Helm-installed resources lack this; SSA fallback tracked in [#601](https://github.com/skyhook-io/radar/issues/601).
 
 ### Timeline
 - In-memory or SQLite storage for event tracking (`--timeline-storage`)

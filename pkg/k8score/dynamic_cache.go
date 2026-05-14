@@ -595,6 +595,16 @@ func (d *DynamicResourceCache) ListBlocking(gvr schema.GroupVersionResource, nam
 
 // Get returns a single resource by namespace and name.
 func (d *DynamicResourceCache) Get(gvr schema.GroupVersionResource, namespace, name string) (*unstructured.Unstructured, error) {
+	return d.get(gvr, namespace, name, false)
+}
+
+// GetPreserveLastApplied returns a single cached resource while preserving the
+// kubectl last-applied annotation for internal drift computation.
+func (d *DynamicResourceCache) GetPreserveLastApplied(gvr schema.GroupVersionResource, namespace, name string) (*unstructured.Unstructured, error) {
+	return d.get(gvr, namespace, name, true)
+}
+
+func (d *DynamicResourceCache) get(gvr schema.GroupVersionResource, namespace, name string, preserveLastApplied bool) (*unstructured.Unstructured, error) {
 	if d == nil {
 		return nil, fmt.Errorf("dynamic resource cache not initialized")
 	}
@@ -643,6 +653,9 @@ func (d *DynamicResourceCache) Get(gvr schema.GroupVersionResource, namespace, n
 		return nil, fmt.Errorf("unexpected type in cache")
 	}
 
+	if preserveLastApplied {
+		return StripUnstructuredFieldsPreserveLastApplied(u), nil
+	}
 	return StripUnstructuredFields(u), nil
 }
 
@@ -692,6 +705,24 @@ func (d *DynamicResourceCache) ListDirect(ctx context.Context, gvr schema.GroupV
 
 // GetDirect fetches a single resource directly from the API (bypasses cache).
 func (d *DynamicResourceCache) GetDirect(ctx context.Context, gvr schema.GroupVersionResource, namespace, name string) (*unstructured.Unstructured, error) {
+	return d.getDirect(ctx, gvr, namespace, name, false)
+}
+
+// GetDirectPreserveLastApplied fetches a single resource directly from the
+// API while preserving kubectl.kubernetes.io/last-applied-configuration. Used
+// exclusively by GitOps drift detection, which needs the annotation to diff
+// declared vs live state. Bypasses the dynamic informer entirely on purpose:
+// caching this code path would otherwise force-start an informer for the
+// resource's GVR (often core kinds like apps/Deployment, /v1/Service that
+// Argo's status.resources references) and retain last-applied across every
+// object cluster-wide — a meaningful memory regression to power a per-page
+// diagnostic. Direct GET pays one API round-trip per managed resource per
+// insight build (memoized 5s upstream).
+func (d *DynamicResourceCache) GetDirectPreserveLastApplied(ctx context.Context, gvr schema.GroupVersionResource, namespace, name string) (*unstructured.Unstructured, error) {
+	return d.getDirect(ctx, gvr, namespace, name, true)
+}
+
+func (d *DynamicResourceCache) getDirect(ctx context.Context, gvr schema.GroupVersionResource, namespace, name string, preserveLastApplied bool) (*unstructured.Unstructured, error) {
 	var u *unstructured.Unstructured
 	var err error
 
@@ -705,6 +736,9 @@ func (d *DynamicResourceCache) GetDirect(ctx context.Context, gvr schema.GroupVe
 		return nil, err
 	}
 
+	if preserveLastApplied {
+		return StripUnstructuredFieldsPreserveLastApplied(u), nil
+	}
 	return StripUnstructuredFields(u), nil
 }
 

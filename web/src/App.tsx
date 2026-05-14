@@ -6,7 +6,7 @@ import { useQueryClient } from '@tanstack/react-query'
 import { useNavigate, useLocation, useSearchParams, useNavigationType, NavigationType } from 'react-router-dom'
 import { HomeView } from './components/home/HomeView'
 import { DebugOverlay } from './components/DebugOverlay'
-import { TopologyGraph, TopologyFilterSidebar, TopologyControls } from '@skyhook-io/k8s-ui'
+import { TopologyGraph, TopologyFilterSidebar, TopologyControls, gitOpsRouteForKind } from '@skyhook-io/k8s-ui'
 import { TimelineView } from './components/timeline/TimelineView'
 import { ResourcesView } from './components/resources/ResourcesView'
 import { serializeColumnFilters } from './components/resources/resource-utils'
@@ -16,6 +16,7 @@ import { HelmView } from './components/helm/HelmView'
 import { TrafficView } from './components/traffic/TrafficView'
 import { CostView } from './components/cost/CostView'
 import { AuditView } from './components/audit/AuditView'
+import { GitOpsView } from './components/gitops/GitOpsView'
 import { HelmReleaseDrawer } from './components/helm/HelmReleaseDrawer'
 import { PortForwardProvider, PortForwardIndicator, PortForwardPanel } from './components/portforward/PortForwardManager'
 import { DockProvider, BottomDock, useDock, useDockReservedHeight, useOpenLocalTerminal } from './components/dock'
@@ -39,7 +40,7 @@ import { routePath, apiUrl, getAuthHeaders, getCredentialsMode } from './api/con
 import { KeyboardShortcutProvider, useRegisterShortcut, useRegisterShortcuts } from './hooks/useKeyboardShortcuts'
 import { useAnimatedUnmount } from './hooks/useAnimatedUnmount'
 import radarLoadingIcon from '@skyhook-io/k8s-ui/assets/radar/radar-icon-loading.svg'
-import { RefreshCw, Network, List, Clock, Package, Sun, Moon, Activity, Home, Star, Search, Bug, Settings, SquareTerminal, ShieldCheck } from 'lucide-react'
+import { RefreshCw, Network, List, Clock, Package, Sun, Moon, Activity, Home, Star, Search, Bug, Settings, SquareTerminal, ShieldCheck, GitBranch } from 'lucide-react'
 import { useTheme } from './context/ThemeContext'
 import { Tooltip } from './components/ui/Tooltip'
 import { LargeClusterNamespacePicker } from './components/shared/LargeClusterNamespacePicker'
@@ -115,7 +116,7 @@ function apiResourceToNodeIdPrefix(apiResource: string): string {
 }
 
 // Extended MainView type that includes traffic and cost
-type ExtendedMainView = MainView | 'traffic' | 'cost' | 'workload' | 'audit'
+type ExtendedMainView = MainView | 'traffic' | 'cost' | 'workload' | 'audit' | 'gitops'
 
 // Extract view from URL path
 function getViewFromPath(pathname: string): ExtendedMainView {
@@ -129,6 +130,7 @@ function getViewFromPath(pathname: string): ExtendedMainView {
   if (path === 'cost') return 'cost'
   if (path === 'workload') return 'workload'
   if (path === 'audit') return 'audit'
+  if (path === 'gitops') return 'gitops'
   return 'home'
 }
 
@@ -395,7 +397,7 @@ function AppInner() {
   const contextSwitcherRef = useRef<ContextSwitcherHandle>(null)
 
   // View switching keyboard shortcuts
-  const views: ExtendedMainView[] = ['home', 'topology', 'resources', 'timeline', 'helm', 'traffic', 'cost', 'audit']
+  const views: ExtendedMainView[] = ['home', 'topology', 'resources', 'timeline', 'helm', 'gitops', 'traffic', 'cost', 'audit']
   useRegisterShortcuts([
     ...views.map((view, i) => ({
       id: `view-${view}`,
@@ -542,6 +544,16 @@ function AppInner() {
       if (pending.kinds.has('secrets')) {
         queryClient.invalidateQueries({ queryKey: ['secret-cert-expiry'] })
       }
+      // GitOps tree + insights are derived views over the same informer
+      // cache that produced this SSE event — when *anything* changes, the
+      // managed-resource tree and the insights pipeline can have stale
+      // changes/events/drift. Invalidating broadly here is cheap (only the
+      // currently-mounted GitOps view re-fetches; other views have no
+      // matching keys) and is what makes the detail page actually live.
+      // Without this the failure card + topology lag behind the title chips
+      // until window focus or a manual refresh.
+      queryClient.invalidateQueries({ queryKey: ['gitops-tree'] })
+      queryClient.invalidateQueries({ queryKey: ['gitops-insights'] })
       // Reset accumulator
       pending.kinds = new Set()
       pending.hasCountChange = false
@@ -677,13 +689,24 @@ function AppInner() {
     // TODO: Could show a list of pods in the group
     if (node.kind === 'PodGroup') return
 
+    const namespace = (node.data.namespace as string) || ''
+    // GitOps CRs (Application/Kustomization/HelmRelease/etc.) have a dedicated
+    // detail page with tree + insights + ops that the drawer can't reproduce.
+    // Route there from the main topology when the node is one of those kinds;
+    // everything else falls back to the drawer.
+    const gitOpsPath = gitOpsRouteForKind(node.kind, namespace, node.name)
+    if (gitOpsPath) {
+      navigate(gitOpsPath)
+      return
+    }
+
     navigateToResource({
       kind: kindToPlural(node.kind),
-      namespace: (node.data.namespace as string) || '',
+      namespace,
       name: node.name,
       group: apiVersionToGroup(node.data.apiVersion as string | undefined),
     })
-  }, [])
+  }, [navigate])
 
   // Serialize namespaces for stable dependency tracking
   const namespacesKey = namespaces.join(',')
@@ -994,7 +1017,7 @@ function AppInner() {
                   collide with the absolute-centered nav block at xl, which
                   is the same breakpoint where nav labels appear. */}
               {(!connected || crdDiscoveryStatus === 'discovering') && (
-                <span className="text-xs text-theme-text-tertiary hidden xl:inline">
+                <span className="text-[11px] text-theme-text-tertiary hidden xl:inline">
                   {!connected ? 'Disconnected' : 'Discovering Custom Resources...'}
                 </span>
               )}
@@ -1015,13 +1038,14 @@ function AppInner() {
         </div>
 
         {/* Center: View tabs — absolute centered on wide, flows after left section on narrow */}
-        <div className="md:absolute md:left-1/2 md:-translate-x-1/2 flex items-center gap-1 bg-theme-elevated/50 rounded-full p-1 ml-2 md:ml-0">
+        <div className="md:absolute md:left-1/2 md:-translate-x-1/2 flex items-center gap-0.5 bg-theme-elevated/50 rounded-full p-1 ml-2 md:ml-0">
           {([
             { view: 'home' as const, icon: Home, label: 'Home' },
             { view: 'topology' as const, icon: Network, label: 'Topology' },
             { view: 'resources' as const, icon: List, label: 'Resources' },
             { view: 'timeline' as const, icon: Clock, label: 'Timeline' },
             { view: 'helm' as const, icon: Package, label: 'Helm' },
+            { view: 'gitops' as const, icon: GitBranch, label: 'GitOps' },
             { view: 'traffic' as const, icon: Activity, label: 'Traffic' },
             // Cost is intentionally hidden from the pill bar for now — the view still
             // exists and is reachable via /cost, the Home dashboard card, and the
@@ -1031,7 +1055,7 @@ function AppInner() {
             <Tooltip key={view} content={label} delay={100} position="bottom">
               <button
                 onClick={() => setMainView(view)}
-                className={`flex items-center gap-1.5 px-2.5 py-1.5 text-sm rounded-full transition-colors ${
+                className={`flex items-center gap-1 px-2 py-1 text-[13px] rounded-full transition-colors ${
                   mainView === view
                     ? 'bg-skyhook-600 dark:bg-skyhook-500 text-white shadow-glow-brand-sm'
                     : 'text-theme-text-secondary hover:text-theme-text-primary hover:bg-theme-hover'
@@ -1396,6 +1420,16 @@ function AppInner() {
                 params.delete('releaseStorage')
               }
               setSearchParams(params, { replace: true })
+            }}
+          />
+        )}
+
+        {/* GitOps view */}
+        {mainView === 'gitops' && (
+          <GitOpsView
+            namespaces={namespaces}
+            onOpenResource={(resource) => {
+              setSelectedResource(resource)
             }}
           />
         )}
