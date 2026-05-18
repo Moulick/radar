@@ -13,6 +13,52 @@ import (
 	"github.com/skyhook-io/radar/pkg/policyreports"
 )
 
+// KyvernoStatus reports why the PolicyReport index is (or isn't) populated.
+// Callers that need to distinguish "Kyverno not installed" from "warmup
+// deferred (cluster too large)" from "warmup in flight" from "ready but
+// empty" use GetKyvernoStatus to surface the reason to the operator/agent
+// — otherwise an empty PolicyReport response is indistinguishable from a
+// transient one.
+type KyvernoStatus string
+
+const (
+	// KyvernoStatusNotInstalled — Kyverno's Policy/ClusterPolicy CRDs are
+	// not present in discovery. The PolicyReport source is unavailable;
+	// nothing to do.
+	KyvernoStatusNotInstalled KyvernoStatus = "not_installed"
+	// KyvernoStatusDeferred — Kyverno is installed but warmup decided not
+	// to track PolicyReports (cluster aggregate exceeds the warmup cap, or
+	// the probe was denied/errored). Findings are NOT being indexed.
+	// Callers wanting them must fall back to a direct fetch.
+	KyvernoStatusDeferred KyvernoStatus = "deferred"
+	// KyvernoStatusWarmup — Kyverno is installed and warmup is presumed
+	// in-flight (discovery has named the CRDs but the index hasn't been
+	// published yet). Narrow window; expect to become "ready" shortly.
+	KyvernoStatusWarmup KyvernoStatus = "warmup"
+	// KyvernoStatusReady — PolicyReport index is populated and live. An
+	// empty findings list with this status means "no policy violations",
+	// not "data unavailable".
+	KyvernoStatusReady KyvernoStatus = "ready"
+)
+
+// kyvernoWarmupDecision is set by WarmupKyvernoPolicyReports to record
+// the outcome of its single decision pass: empty (warmup hasn't run yet)
+// vs not-installed vs deferred vs ready. Read by GetKyvernoStatus so
+// callers can disambiguate a nil GetPolicyReportIndex() return. Writes
+// from WarmupKyvernoPolicyReports go through setDecisionIfCurrent so a
+// pre-Reset warmup goroutine that's still running can't stamp its
+// outcome onto the new cluster's atomic.
+var kyvernoWarmupDecision atomic.Value // holds KyvernoStatus, "" before first decision
+
+// kyvernoWarmupGen serializes "is this warmup still the current one"
+// against context-switch Resets. Each Warmup invocation captures the
+// generation at the start of its lambda; Reset bumps the counter before
+// clearing state. Stale warmup completions (e.g. an in-flight Old-cluster
+// warmup that hasn't yet stored ready when Reset fires for the new
+// cluster) see a mismatch and skip their writes, so the new cluster never
+// inherits the old cluster's index or decision.
+var kyvernoWarmupGen atomic.Int64
+
 // PolicyReport GVRs. Kept here (not in supportedCRDFallbacks) because
 // warmup is conditional — we only register informers for these CRDs when
 // Kyverno's own Policy/ClusterPolicy CRDs are present in discovery.
@@ -105,20 +151,60 @@ func GetPolicyReportIndex() *policyreports.Index {
 // lazily. Documented limitation, not blocking — context switches are the
 // dominant lifecycle event in practice.
 func WarmupKyvernoPolicyReports() {
-	policyReportInit.Do(func() {
+	// Snapshot BOTH the *sync.Once and the warmup generation under the
+	// mutex BEFORE entering Do(). If we read policyReportInit unsynchronized
+	// and captured myGen inside the lambda, a Reset interleaving between the
+	// caller's read of policyReportInit and the lambda's Load of
+	// kyvernoWarmupGen would let the lambda capture the POST-Reset gen,
+	// and its subsequent writes (which check gen under the mutex) would
+	// match — stamping the previous cluster's outcome onto the new cluster's
+	// atomics. Capturing both under the same mutex Reset holds closes that
+	// window: either we see the pre-Reset (once, gen) pair and Reset's
+	// bump invalidates our writes, or we see the post-Reset (once', gen')
+	// pair and run cleanly under the new sync.Once.
+	policyReportMu.Lock()
+	once := policyReportInit
+	myGen := kyvernoWarmupGen.Load()
+	policyReportMu.Unlock()
+	once.Do(func() {
+		setDecision := func(s KyvernoStatus) {
+			policyReportMu.Lock()
+			defer policyReportMu.Unlock()
+			if kyvernoWarmupGen.Load() != myGen {
+				return
+			}
+			kyvernoWarmupDecision.Store(s)
+		}
+		publishReady := func(idx *policyreports.Index, watched []schema.GroupVersionResource) {
+			policyReportMu.Lock()
+			defer policyReportMu.Unlock()
+			if kyvernoWarmupGen.Load() != myGen {
+				return
+			}
+			policyReportIndex.Store(idx)
+			policyReportWatched = watched
+			kyvernoWarmupDecision.Store(KyvernoStatusReady)
+		}
+
 		discovery := GetResourceDiscovery()
 		if discovery == nil || discovery.ResourceDiscovery == nil {
 			log.Printf("[policy-reports] No resource discovery available; skipping Kyverno detection")
+			// Discovery unavailable is operationally indistinguishable from
+			// "not installed" — the consumer surface only needs to know
+			// findings won't appear.
+			setDecision(KyvernoStatusNotInstalled)
 			return
 		}
 		if !discovery.IsKyvernoInstalled() {
 			log.Printf("[policy-reports] Kyverno not detected (no kyverno.io/Policy or ClusterPolicy); leaving PolicyReports deferred")
+			setDecision(KyvernoStatusNotInstalled)
 			return
 		}
 
 		cache := GetDynamicResourceCache()
 		if cache == nil || cache.DynamicResourceCache == nil {
 			log.Printf("[policy-reports] Dynamic resource cache not initialized; cannot warm up PolicyReports")
+			setDecision(KyvernoStatusDeferred)
 			return
 		}
 
@@ -141,6 +227,10 @@ func WarmupKyvernoPolicyReports() {
 
 		if len(watched) == 0 {
 			log.Printf("[policy-reports] Kyverno detected but no wgpolicyk8s.io PolicyReport CRDs are registered for watch; nothing to warm up")
+			// Kyverno is installed but the reporting CRDs aren't — operator
+			// has Kyverno without the policy-reporter shim. Surface as
+			// not_installed because there is no PolicyReport data to expose.
+			setDecision(KyvernoStatusNotInstalled)
 			return
 		}
 
@@ -158,12 +248,14 @@ func WarmupKyvernoPolicyReports() {
 				// -1 RBAC denied, -2 transient probe error. Either way, we
 				// can't bound the warmup cost; defer rather than gamble.
 				log.Printf("[policy-reports] Probe for %s returned %d; deferring PolicyReport warmup", gvr, count)
+				setDecision(KyvernoStatusDeferred)
 				return
 			}
 			total += count
 		}
 		if total > kyvernoReportWarmupCap {
 			log.Printf("[policy-reports] Cluster has %d PolicyReports across %d CRDs (cap=%d); leaving deferred to avoid full-cluster watch cost", total, len(watched), kyvernoReportWarmupCap)
+			setDecision(KyvernoStatusDeferred)
 			return
 		}
 
@@ -175,22 +267,14 @@ func WarmupKyvernoPolicyReports() {
 		// with the informer's initial event burst.
 		idx := policyreports.NewIndex()
 		idx.Replace(listPolicyReportsAll(watched))
-		// Publish index + watched-GVR list together under the mutex. The
-		// rebuild path reads policyReportWatched while holding the same
-		// mutex, and ResetPolicyReportIndex (context switch) takes it to
-		// clear both. Without the lock here, a concurrent Reset would race
-		// with this assignment and could leave the new context with stale
-		// GVRs from the prior cluster.
-		policyReportMu.Lock()
-		policyReportIndex.Store(idx)
-		policyReportWatched = watched
-		policyReportMu.Unlock()
 
-		// Register event handlers for live updates. Each handler does a
-		// debounced rebuild — PolicyReport events arrive in bursts when
-		// Kyverno re-evaluates a policy, and rebuilding once per burst
-		// is cheaper than per-event incremental updates given how small
-		// the index is (≤500 reports).
+		// Register event handlers for live updates BEFORE publishing the
+		// index so a debounced rebuild that fires during publishReady's
+		// critical section sees the new policyReportWatched value. Each
+		// handler does a debounced rebuild — PolicyReport events arrive
+		// in bursts when Kyverno re-evaluates a policy, and rebuilding
+		// once per burst is cheaper than per-event incremental updates
+		// given how small the index is (≤500 reports).
 		handler := toolscache.ResourceEventHandlerFuncs{
 			AddFunc:    func(_ any) { scheduleRebuild() },
 			UpdateFunc: func(_, _ any) { scheduleRebuild() },
@@ -204,8 +288,47 @@ func WarmupKyvernoPolicyReports() {
 			}
 		}
 
+		// Publish index + watched-GVR list + ready decision together
+		// under the mutex. The rebuild path reads policyReportWatched
+		// while holding the same mutex, and ResetPolicyReportIndex
+		// (context switch) takes it to clear both. publishReady's
+		// generation check ensures a Reset that fires before this point
+		// causes the writes to be skipped, so the new cluster never
+		// inherits the old cluster's index or decision.
+		publishReady(idx, watched)
 		log.Printf("[policy-reports] Index initialized with %d subjects", idx.Size())
 	})
+}
+
+// GetKyvernoStatus reports the lifecycle phase of the PolicyReport index.
+// Distinguishes the four cases that a nil GetPolicyReportIndex() return
+// collapses today:
+//
+//	not_installed — discovery decided Kyverno is absent (or the reporting
+//	                CRDs are missing); findings will never appear.
+//	deferred      — warmup ran but skipped indexing (cluster exceeded the
+//	                cap, or RBAC/probe error). Findings won't appear from
+//	                this index; callers may fall back to on-demand.
+//	warmup        — warmup hasn't completed its decision pass yet (typical
+//	                for the first second or two after subsystem init); the
+//	                index is uninitialized.
+//	ready         — index is live. An empty findings list under this
+//	                status means "no violations", not "data unavailable".
+//
+// Cheap: a single atomic.Value Load. Safe to call from request paths.
+func GetKyvernoStatus() KyvernoStatus {
+	// Ready is authoritative: even if a stale "warmup" decision is in the
+	// atomic (legal during a window in WarmupKyvernoPolicyReports where
+	// the index publishes before the decision flag), the presence of an
+	// index means we are ready.
+	if policyReportIndex.Load() != nil {
+		return KyvernoStatusReady
+	}
+	v, _ := kyvernoWarmupDecision.Load().(KyvernoStatus)
+	if v == "" {
+		return KyvernoStatusWarmup
+	}
+	return v
 }
 
 // listPolicyReportsAll concatenates reports from every watched GVR.
@@ -279,9 +402,18 @@ func ResetPolicyReportIndex() {
 	policyReportMu.Lock()
 	defer policyReportMu.Unlock()
 
+	// Bump the generation inside the critical section so any in-flight
+	// warmup goroutine's setDecision/publishReady call (which checks gen
+	// under the same mutex) skips its writes instead of stamping the old
+	// cluster's outcome onto the new cluster's atomic.
+	kyvernoWarmupGen.Add(1)
 	policyReportIndex.Store(nil)
 	policyReportWatched = nil
 	policyReportPending.Store(false)
+	// Clear the warmup decision too — the new cluster gets a fresh
+	// detection pass, and GetKyvernoStatus should report "warmup" until
+	// the new pass completes (not whatever the previous cluster decided).
+	kyvernoWarmupDecision.Store(KyvernoStatus(""))
 	// Replace the pointer rather than zeroing the value — see the comment
 	// on policyReportInit's declaration. Any Do() lambda still running on
 	// the old *sync.Once finishes against that instance without

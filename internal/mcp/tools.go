@@ -180,10 +180,18 @@ func registerTools(server *mcp.Server) {
 			"recent K8s Warning events, and a generic CRD .status.conditions[] " +
 			"fallback that lights up Argo / Flux / Knative / Crossplane / cert-manager / " +
 			"KEDA without per-integration code. Severity is normalized to " +
-			"critical / warning / info. Audit findings (best-practice scan) are excluded " +
-			"by default — pass source=audit to opt them in. Use this instead of " +
-			"get_dashboard when you want the full health picture across all sources, or " +
-			"to filter by severity / source / kind / namespace.",
+			"critical / warning / info. Defaults to problem + condition sources; " +
+			"audit (best-practice scan), event (K8s Warning events) and kyverno " +
+			"(PolicyReport findings) are excluded by default because each can run " +
+			"50–1000+ rows per cluster. The `source` param is a FILTER: " +
+			"source=kyverno returns ONLY Kyverno rows (no problems, no conditions). " +
+			"To ADD an excluded source to the defaults via MCP, list everything " +
+			"you want explicitly — e.g. source=problem,condition,kyverno returns " +
+			"defaults plus Kyverno. (The REST /api/issues endpoint also exposes " +
+			"include_audit / include_events / include_kyverno boolean flags as " +
+			"shortcuts, but MCP only takes the source list.) Use this instead of " +
+			"get_dashboard when you want the full health picture across all " +
+			"sources, or to filter by severity / source / kind / namespace.",
 		Annotations: readOnly,
 	}, logToolCall("issues", handleIssuesTool))
 
@@ -335,7 +343,7 @@ type searchInput struct {
 type issuesInput struct {
 	Namespace string `json:"namespace,omitempty" jsonschema:"filter to one namespace"`
 	Severity  string `json:"severity,omitempty" jsonschema:"comma-separated: critical,warning"`
-	Source    string `json:"source,omitempty" jsonschema:"comma-separated: problem,audit,event,condition. Defaults to problem+condition only. Pass 'event' to opt in K8s Warning events (off by default — they flood thousands per cluster and mostly duplicate problem-source rows). Pass 'audit' to opt in best-practice findings (off by default — 50–200 per cluster)."`
+	Source    string `json:"source,omitempty" jsonschema:"comma-separated list of sources to RETURN: problem,audit,event,condition,kyverno. Acts as a FILTER, not an additive opt-in — when set, only the listed sources appear in the response. Default (omitted): problem+condition only (audit + event + kyverno excluded because each is loud: events flood thousands per cluster and mostly duplicate problem-source rows; audit runs 50–200 per cluster; Kyverno PolicyReports typically 10+ rows per workload under a baseline PSS profile). Examples: source='kyverno' returns ONLY Kyverno rows (no problems, no conditions); source='problem,condition,kyverno' returns the defaults plus Kyverno. To add a noisy source without silencing the defaults, list the defaults explicitly alongside it."`
 	Kind      string `json:"kind,omitempty" jsonschema:"comma-separated kind filter (e.g. Deployment,Pod)"`
 	Since     string `json:"since,omitempty" jsonschema:"event lookback window, e.g. 15m or 1h. Only affects the event source; when events are enabled and since is omitted, defaults to 1h to avoid pulling the full event-cache backlog."`
 	Limit     int    `json:"limit,omitempty" jsonschema:"max issues returned (default 200, max 1000)"`
@@ -1735,18 +1743,25 @@ func handleIssuesTool(ctx context.Context, _ *mcp.CallToolRequest, input issuesI
 		}
 		filters.Since = d
 	}
-	// Audit + event sources are both opt-in (default off). The
-	// MCP input doesn't surface separate include_* knobs, so the
-	// source list IS the opt-in. Mirror the HTTP handler's
-	// behavior — including the 1h since-default when events are
-	// enabled with no explicit window, so an MCP caller doesn't
-	// silently inherit the full event-cache backlog.
+	// Audit / event / kyverno collection is gated by IncludeX flags
+	// (default off). The MCP input doesn't surface separate include_*
+	// knobs, so listing one of those sources in `source` is the only
+	// way to enable the matching IncludeX. This means source= acts as
+	// BOTH a filter AND the collection trigger for noisy sources:
+	// source=kyverno enables Kyverno collection AND narrows results
+	// to just kyverno rows. To get "defaults plus Kyverno" over MCP,
+	// pass source=problem,condition,kyverno. Mirror the HTTP handler's
+	// 1h since-default when events are enabled with no explicit
+	// window, so an MCP caller doesn't silently inherit the full
+	// event-cache backlog.
 	for _, s := range filters.Sources {
 		switch s {
 		case issues.SourceAudit:
 			filters.IncludeAudit = true
 		case issues.SourceEvent:
 			filters.IncludeEvents = true
+		case issues.SourceKyverno:
+			filters.IncludeKyverno = true
 		}
 	}
 	if filters.IncludeEvents && filters.Since == 0 {
@@ -1765,6 +1780,20 @@ func handleIssuesTool(ctx context.Context, _ *mcp.CallToolRequest, input issuesI
 	if stats.FilterErrors > 0 {
 		resp["filter_errors"] = stats.FilterErrors
 		resp["filter_error_sample"] = stats.FilterErrorSample
+	}
+	// Surface the Kyverno index lifecycle when the caller asked for it.
+	// Without this an empty kyverno list collapses four states
+	// (not_installed / deferred / warmup / ready-but-empty) into one,
+	// and the agent can't tell whether to fall back to a direct fetch
+	// or report "cluster has no violations" to the operator. Mirrors
+	// the HTTP /api/issues response shape.
+	if filters.IncludeKyverno {
+		meta, _ := resp["meta"].(map[string]any)
+		if meta == nil {
+			meta = map[string]any{}
+		}
+		meta["kyverno"] = provider.KyvernoStatus()
+		resp["meta"] = meta
 	}
 	return toJSONResult(resp)
 }
@@ -1806,8 +1835,10 @@ func parseSourceList(v string) ([]issues.Source, error) {
 			out = append(out, issues.SourceEvent)
 		case "condition":
 			out = append(out, issues.SourceCondition)
+		case "kyverno":
+			out = append(out, issues.SourceKyverno)
 		default:
-			return nil, fmt.Errorf("unknown source %q (want: problem, audit, event, condition)", p)
+			return nil, fmt.Errorf("unknown source %q (want: problem, audit, event, condition, kyverno)", p)
 		}
 	}
 	return out, nil
