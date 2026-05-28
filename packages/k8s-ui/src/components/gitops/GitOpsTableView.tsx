@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ComponentType, type ReactNode } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type ComponentType, type MouseEvent as ReactMouseEvent, type ReactNode } from 'react'
 import { clsx } from 'clsx'
 import {
   AlertTriangle,
@@ -141,14 +141,27 @@ export interface GitOpsTableViewProps {
   counts: Record<string, number>
   // Caller refresh — typically invalidates its useQuery + refetches.
   onRefresh?: () => void
-  // Row click — caller routes to its own detail page.
-  onRowClick: (row: GitOpsRow) => void
+  // Row click — caller routes to its own detail page. When the host also
+  // passes `rowHrefFor`, the callback receives the MouseEvent so it can
+  // `preventDefault()` for SPA-local nav (e.g. react-router) or skip the
+  // preventDefault to let the anchor's default full-page navigation run
+  // (required for cross-router-boundary links).
+  onRowClick: (row: GitOpsRow, event?: ReactMouseEvent) => void
+  /** When provided, the Application-name cell renders as a real `<a href>`
+   *  and the `<tr>` drops its row-level click handler. Restores ⌘-click /
+   *  middle-click / "Copy link" / hover URL preview / screen-reader link
+   *  semantics. `onRowClick` still fires on unmodified clicks (event arg
+   *  supplied) for analytics or to take over navigation. */
+  rowHrefFor?: (row: GitOpsRow) => string
 
   // Called when the user clicks the destination cluster chip in the
   // Destination cell. Fleet-only; OSS leaves undefined. Caller routes to
   // the destination cluster's workloads view (filtered by the Argo
   // instance label) — the chip itself stops row-click propagation.
   onDestinationClick?: (row: GitOpsRow, destination: FleetDestinationStamp) => void
+  /** Anchor equivalent of `onDestinationClick`. Same rationale as
+   *  `rowHrefFor` — real `<a href>` for the destination chip. */
+  destinationHrefFor?: (row: GitOpsRow, destination: FleetDestinationStamp) => string
   // Cross-cluster surfaces (Hub-only); OSS leaves these undefined.
   crossClusterCount?: number
   destinationFilter?: DestinationFilter
@@ -188,7 +201,9 @@ export function GitOpsTableView({
   counts,
   onRefresh,
   onRowClick,
+  rowHrefFor,
   onDestinationClick,
+  destinationHrefFor,
   crossClusterCount,
   destinationFilter,
   onDestinationFilterChange,
@@ -627,9 +642,9 @@ export function GitOpsTableView({
               )}
             </div>
           ) : viewMode === 'tiles' ? (
-            <GitOpsTiles rows={filteredRows} onOpen={onRowClick} />
+            <GitOpsTiles rows={filteredRows} onOpen={onRowClick} hrefFor={rowHrefFor} />
           ) : (
-            <GitOpsTable rows={filteredRows} onOpen={onRowClick} onDestinationClick={onDestinationClick} />
+            <GitOpsTable rows={filteredRows} onOpen={onRowClick} hrefFor={rowHrefFor} onDestinationClick={onDestinationClick} destinationHrefFor={destinationHrefFor} />
           )}
         </div>
       </div>
@@ -1017,11 +1032,15 @@ function StatusDistribution({ rows }: { rows: GitOpsRow[] }) {
 function GitOpsTable({
   rows,
   onOpen,
+  hrefFor,
   onDestinationClick,
+  destinationHrefFor,
 }: {
   rows: GitOpsRow[]
-  onOpen: (row: GitOpsRow) => void
+  onOpen: (row: GitOpsRow, event?: ReactMouseEvent) => void
+  hrefFor?: (row: GitOpsRow) => string
   onDestinationClick?: (row: GitOpsRow, destination: FleetDestinationStamp) => void
+  destinationHrefFor?: (row: GitOpsRow, destination: FleetDestinationStamp) => string
 }) {
   return (
     <table className="w-full min-w-[1040px] table-fixed border-separate border-spacing-0 text-sm">
@@ -1037,65 +1056,82 @@ function GitOpsTable({
         </tr>
       </thead>
       <tbody>
-        {rows.map((row) => (
-          <tr
-            key={row.id}
-            onClick={() => onOpen(row)}
-            className={clsx(
-              'cursor-pointer border-b border-theme-border bg-theme-base hover:bg-theme-hover',
-              row.terminating && 'opacity-70',
-            )}
-          >
-            <TableCell>
-              <div className="flex min-w-0 items-center gap-2">
-                <span className={`h-8 w-1 shrink-0 rounded-full ${statusStripe(row)}`} />
-                {row.terminating && (
-                  <Tooltip content="Pending deletion — finalizers still running">
-                    <span className="inline-flex shrink-0 items-center gap-1 rounded border border-orange-500/40 bg-orange-500/15 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-orange-400">
-                      <Trash2 className="h-3 w-3" />
-                      Terminating
-                    </span>
-                  </Tooltip>
-                )}
-                <div className="min-w-0">
-                  <div className="truncate font-medium text-theme-text-primary">{row.name}</div>
-                  <div className="truncate text-xs text-theme-text-tertiary">
-                    {row.tool === 'argo' ? 'ArgoCD' : 'FluxCD'} {row.kind}
-                    {row._cluster && (
-                      <span title={row._cluster.name !== shortClusterName(row._cluster.name) ? row._cluster.name : undefined}>
-                        {' · '}{shortClusterName(row._cluster.name)}
+        {rows.map((row) => {
+          const href = hrefFor?.(row)
+          return (
+            <tr
+              key={row.id}
+              onClick={href ? undefined : () => onOpen(row)}
+              className={clsx(
+                'border-b border-theme-border bg-theme-base hover:bg-theme-hover',
+                !href && 'cursor-pointer',
+                row.terminating && 'opacity-70',
+              )}
+            >
+              <TableCell>
+                <div className="flex min-w-0 items-center gap-2">
+                  <span className={`h-8 w-1 shrink-0 rounded-full ${statusStripe(row)}`} />
+                  {row.terminating && (
+                    <Tooltip content="Pending deletion — finalizers still running">
+                      <span className="inline-flex shrink-0 items-center gap-1 rounded border border-orange-500/40 bg-orange-500/15 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-orange-400">
+                        <Trash2 className="h-3 w-3" />
+                        Terminating
                       </span>
+                    </Tooltip>
+                  )}
+                  <div className="min-w-0">
+                    {href ? (
+                      <a
+                        href={href}
+                        onClick={(e) => {
+                          if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return
+                          onOpen(row, e)
+                        }}
+                        className="block truncate font-medium text-theme-text-primary hover:underline focus-visible:underline focus-visible:outline-none rounded-sm"
+                      >
+                        {row.name}
+                      </a>
+                    ) : (
+                      <div className="truncate font-medium text-theme-text-primary">{row.name}</div>
                     )}
+                    <div className="truncate text-xs text-theme-text-tertiary">
+                      {row.tool === 'argo' ? 'ArgoCD' : 'FluxCD'} {row.kind}
+                      {row._cluster && (
+                        <span title={row._cluster.name !== shortClusterName(row._cluster.name) ? row._cluster.name : undefined}>
+                          {' · '}{shortClusterName(row._cluster.name)}
+                        </span>
+                      )}
+                    </div>
                   </div>
                 </div>
-              </div>
-            </TableCell>
-            <TableCell>{row.project || '-'}</TableCell>
-            <TableCell>
-              {row.terminating
-                ? <span className="text-[11px] text-theme-text-tertiary">—</span>
-                : <SyncStatusBadge sync={row.sync as any} suspended={row.suspended} />}
-            </TableCell>
-            <TableCell>
-              {row.terminating
-                ? <span className="text-[11px] text-theme-text-tertiary">—</span>
-                : <HealthStatusBadge health={row.health as any} />}
-            </TableCell>
-            <TableCell>
-              <div className="truncate text-theme-text-primary">{row.repository || row.chart || '-'}</div>
-              <div className="truncate text-xs text-theme-text-tertiary">{[row.targetRevision, row.path || row.chart].filter(Boolean).join(' · ') || '-'}</div>
-            </TableCell>
-            <TableCell>
-              <DestinationCell row={row} onDestinationClick={onDestinationClick} />
-              <div className="truncate text-xs text-theme-text-tertiary">{row.destinationNamespace || row.namespace || '-'}</div>
-            </TableCell>
-            <TableCell>
-              {row.terminating
-                ? <span className="text-orange-400/80">Pending {formatRelativeAge(row.terminationStartedAt ?? '') || 'now'}</span>
-                : formatRelativeAge(row.lastSync || row.createdAt)}
-            </TableCell>
-          </tr>
-        ))}
+              </TableCell>
+              <TableCell>{row.project || '-'}</TableCell>
+              <TableCell>
+                {row.terminating
+                  ? <span className="text-[11px] text-theme-text-tertiary">—</span>
+                  : <SyncStatusBadge sync={row.sync as any} suspended={row.suspended} />}
+              </TableCell>
+              <TableCell>
+                {row.terminating
+                  ? <span className="text-[11px] text-theme-text-tertiary">—</span>
+                  : <HealthStatusBadge health={row.health as any} />}
+              </TableCell>
+              <TableCell>
+                <div className="truncate text-theme-text-primary">{row.repository || row.chart || '-'}</div>
+                <div className="truncate text-xs text-theme-text-tertiary">{[row.targetRevision, row.path || row.chart].filter(Boolean).join(' · ') || '-'}</div>
+              </TableCell>
+              <TableCell>
+                <DestinationCell row={row} onDestinationClick={onDestinationClick} destinationHrefFor={destinationHrefFor} />
+                <div className="truncate text-xs text-theme-text-tertiary">{row.destinationNamespace || row.namespace || '-'}</div>
+              </TableCell>
+              <TableCell>
+                {row.terminating
+                  ? <span className="text-orange-400/80">Pending {formatRelativeAge(row.terminationStartedAt ?? '') || 'now'}</span>
+                  : formatRelativeAge(row.lastSync || row.createdAt)}
+              </TableCell>
+            </tr>
+          )
+        })}
       </tbody>
     </table>
   )
@@ -1104,14 +1140,16 @@ function GitOpsTable({
 function GitOpsTiles({
   rows,
   onOpen,
+  hrefFor,
 }: {
   rows: GitOpsRow[]
-  onOpen: (row: GitOpsRow) => void
+  onOpen: (row: GitOpsRow, event?: ReactMouseEvent) => void
+  hrefFor?: (row: GitOpsRow) => string
 }) {
   return (
     <div className="grid grid-cols-[repeat(auto-fill,minmax(300px,1fr))] gap-3 p-4">
       {rows.map((row) => (
-        <GitOpsTile key={row.id} row={row} onOpen={onOpen} />
+        <GitOpsTile key={row.id} row={row} onOpen={onOpen} href={hrefFor?.(row)} />
       ))}
     </div>
   )
@@ -1120,9 +1158,11 @@ function GitOpsTiles({
 function GitOpsTile({
   row,
   onOpen,
+  href,
 }: {
   row: GitOpsRow
-  onOpen: (row: GitOpsRow) => void
+  onOpen: (row: GitOpsRow, event?: ReactMouseEvent) => void
+  href?: string
 }) {
   const source = compactRepoSource(row.repository || row.chart, row.path || row.chart)
   const revision = row.targetRevision || ''
@@ -1130,15 +1170,12 @@ function GitOpsTile({
   const recencyClass = recencyTone(lastSyncRaw)
   const dest = row.destination ? compactClusterURL(row.destination) : ''
   const ns = row.destinationNamespace || row.namespace
-  return (
-    <button
-      type="button"
-      onClick={() => onOpen(row)}
-      className={clsx(
-        'group relative flex min-w-0 flex-col overflow-hidden rounded-md border border-theme-border bg-theme-surface text-left shadow-theme-sm transition-all hover:border-theme-text-tertiary/40 hover:shadow-theme-md',
-        row.terminating && 'opacity-80',
-      )}
-    >
+  const tileClass = clsx(
+    'group relative flex min-w-0 flex-col overflow-hidden rounded-md border border-theme-border bg-theme-surface text-left shadow-theme-sm transition-all hover:border-theme-text-tertiary/40 hover:shadow-theme-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-theme-text-primary/20',
+    row.terminating && 'opacity-80',
+  )
+  const body = (
+    <>
       <div className={clsx('h-1 w-full', statusStripe(row))} />
       <div className="flex flex-1 flex-col gap-3 px-4 pb-4 pt-3">
         <div className="line-clamp-2 break-all text-[15px] font-semibold leading-tight text-theme-text-primary">
@@ -1184,6 +1221,25 @@ function GitOpsTile({
           </div>
         )}
       </div>
+    </>
+  )
+  if (href) {
+    return (
+      <a
+        href={href}
+        onClick={(e) => {
+          if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return
+          onOpen(row, e)
+        }}
+        className={tileClass}
+      >
+        {body}
+      </a>
+    )
+  }
+  return (
+    <button type="button" onClick={() => onOpen(row)} className={tileClass}>
+      {body}
     </button>
   )
 }
@@ -1260,9 +1316,11 @@ function TableHead({ children, className = '' }: { children: ReactNode; classNam
 function DestinationCell({
   row,
   onDestinationClick,
+  destinationHrefFor,
 }: {
   row: GitOpsRow
   onDestinationClick?: (row: GitOpsRow, destination: FleetDestinationStamp) => void
+  destinationHrefFor?: (row: GitOpsRow, destination: FleetDestinationStamp) => string
 }) {
   const dest = row._destination
   // Non-fleet (OSS) path — show the raw destination string.
@@ -1273,10 +1331,6 @@ function DestinationCell({
     return <span className="block truncate text-theme-text-tertiary">same cluster</span>
   }
   if ((dest.match === 'exact' || dest.match === 'inferred') && dest.cluster_id && dest.cluster_name) {
-    const handleClick = (e: React.MouseEvent) => {
-      e.stopPropagation()
-      onDestinationClick?.(row, dest)
-    }
     const short = shortClusterName(dest.cluster_name)
     // High-confidence (URL match): solid sky chip with a small ✓ marker.
     // Medium-confidence (name match): same chip styling but no marker, and
@@ -1285,19 +1339,41 @@ function DestinationCell({
     // the human-readable reason from the hub.
     const highConfidence = dest.confidence === 'high'
     const tooltipReason = dest.reason ? ` (${dest.reason})` : ''
+    const chipClass =
+      'block max-w-full truncate rounded px-1.5 py-0.5 text-xs font-medium hover:bg-sky-500/20 dark:text-sky-300 ' +
+      (highConfidence
+        ? 'border border-sky-500/50 bg-sky-500/15 text-sky-700'
+        : 'border border-sky-500/25 bg-sky-500/5 text-sky-600')
+    const title = `Open workloads in ${dest.cluster_name}${tooltipReason}`
+    const chipBody = `${highConfidence ? '✓ ' : ''}${short}`
+    const destHref = destinationHrefFor?.(row, dest)
+    if (destHref) {
+      return (
+        <a
+          href={destHref}
+          // The chip sits inside the row's `<td>`; when a host wires
+          // `destinationHrefFor` without `rowHrefFor`, the `<tr>` retains
+          // its own onClick. Stop the bubble so a click on the chip
+          // doesn't also trigger row navigation.
+          onClick={(e) => e.stopPropagation()}
+          className={chipClass + ' focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500/40'}
+          title={title}
+        >
+          {chipBody}
+        </a>
+      )
+    }
     return (
       <button
         type="button"
-        onClick={handleClick}
-        className={
-          'block max-w-full truncate rounded px-1.5 py-0.5 text-xs font-medium hover:bg-sky-500/20 dark:text-sky-300 ' +
-          (highConfidence
-            ? 'border border-sky-500/50 bg-sky-500/15 text-sky-700'
-            : 'border border-sky-500/25 bg-sky-500/5 text-sky-600')
-        }
-        title={`Open workloads in ${dest.cluster_name}${tooltipReason}`}
+        onClick={(e) => {
+          e.stopPropagation()
+          onDestinationClick?.(row, dest)
+        }}
+        className={chipClass}
+        title={title}
       >
-        {highConfidence ? '✓ ' : ''}{short}
+        {chipBody}
       </button>
     )
   }
