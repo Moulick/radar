@@ -2,11 +2,16 @@ package issues
 
 import (
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/kubernetes/fake"
 
 	"github.com/skyhook-io/radar/internal/k8s"
 	"github.com/skyhook-io/radar/pkg/issuesapi"
@@ -24,6 +29,8 @@ type fakeProvider struct {
 	dynamic        map[schema.GroupVersionResource][]*unstructured.Unstructured
 	kinds          map[schema.GroupVersionResource]string
 	namespaced     map[schema.GroupVersionResource]bool
+	selectedPods   map[string][]Ref
+	change         map[string]*issuesapi.ChangeContext
 }
 
 func (f *fakeProvider) DetectProblems(_ []string) []k8s.Detection       { return f.problems }
@@ -50,6 +57,16 @@ func (f *fakeProvider) KindForGVR(gvr schema.GroupVersionResource) string {
 func (f *fakeProvider) NamespacedForGVR(gvr schema.GroupVersionResource) (bool, bool) {
 	namespaced, ok := f.namespaced[gvr]
 	return namespaced, ok
+}
+func (f *fakeProvider) SelectedPodsForService(namespace, name string) []Ref {
+	return f.selectedPods[namespace+"/"+name]
+}
+
+func (f *fakeProvider) ChangeContextForIssue(i Issue) *issuesapi.ChangeContext {
+	if f.change == nil {
+		return nil
+	}
+	return f.change[resourceKey(i.Group, i.Kind, i.Namespace, i.Name)]
 }
 
 func TestCompose_NormalizesProblemSeverity(t *testing.T) {
@@ -369,6 +386,445 @@ func TestCompose_MissingRefsComposedByDefault(t *testing.T) {
 	out := Compose(p, Filters{})
 	if !hasIssueSource(out, SourceProblem) || !hasIssueSource(out, SourceMissingRef) {
 		t.Fatalf("Compose should include problem + missing_ref, got %+v", out)
+	}
+}
+
+func TestCompose_DiagnosticContextMissingRefCandidate(t *testing.T) {
+	p := &fakeProvider{
+		missingRefs: []k8s.Detection{
+			{Kind: "Pod", Namespace: "prod", Name: "web", Severity: "critical", Reason: "Missing ConfigMap"},
+		},
+	}
+
+	out := Compose(p, Filters{})
+	if len(out) != 1 {
+		t.Fatalf("got %d issues, want 1: %+v", len(out), out)
+	}
+	ctx := out[0].DiagnosticContext
+	if ctx == nil || ctx.Role != issuesapi.DiagnosticRoleCandidate {
+		t.Fatalf("diagnostic context = %+v, want candidate", ctx)
+	}
+	if len(ctx.Facts) != 1 || ctx.Facts[0].Type != factExplicitReference {
+		t.Fatalf("facts = %+v, want explicit_reference", ctx.Facts)
+	}
+}
+
+func TestCompose_DiagnosticContextGroupedOwnerRollup(t *testing.T) {
+	p := &fakeProvider{
+		problems: []k8s.Detection{
+			{Kind: "Pod", Namespace: "prod", Name: "web-a", Severity: "critical", Reason: "ImagePullBackOff", OwnerKind: "Deployment", OwnerName: "web"},
+			{Kind: "Pod", Namespace: "prod", Name: "web-b", Severity: "critical", Reason: "ImagePullBackOff", OwnerKind: "Deployment", OwnerName: "web"},
+		},
+	}
+
+	out := Compose(p, Filters{Grouped: true})
+	if len(out) != 1 {
+		t.Fatalf("got %d issues, want 1: %+v", len(out), out)
+	}
+	ctx := out[0].DiagnosticContext
+	if out[0].Kind != "Deployment" || ctx == nil || ctx.Role != issuesapi.DiagnosticRoleRollup {
+		t.Fatalf("issue/context = %+v / %+v, want Deployment rollup", out[0], ctx)
+	}
+	if len(ctx.Facts) != 1 || ctx.Facts[0].Type != factOwnerRollup || len(ctx.Facts[0].Refs) != 2 {
+		t.Fatalf("facts = %+v, want owner_rollup with pod refs", ctx.Facts)
+	}
+}
+
+func TestCompose_DiagnosticContextServiceAffectedByBackendIssues(t *testing.T) {
+	p := &fakeProvider{
+		problems: []k8s.Detection{
+			{Kind: "Service", Namespace: "prod", Name: "api", Severity: "critical", Reason: "0/1 selected pods ready"},
+			{Kind: "Pod", Namespace: "prod", Name: "api-abc", Severity: "critical", Reason: "CrashLoopBackOff", OwnerKind: "Deployment", OwnerName: "api"},
+		},
+		selectedPods: map[string][]Ref{
+			"prod/api": {{Kind: "Pod", Namespace: "prod", Name: "api-abc"}},
+		},
+	}
+
+	out := Compose(p, Filters{Grouped: true})
+	var svc Issue
+	for _, issue := range out {
+		if issue.Kind == "Service" && issue.Name == "api" {
+			svc = issue
+		}
+	}
+	if svc.Kind == "" {
+		t.Fatalf("service issue not found: %+v", out)
+	}
+	ctx := svc.DiagnosticContext
+	if ctx == nil || ctx.Role != issuesapi.DiagnosticRoleAffected {
+		t.Fatalf("diagnostic context = %+v, want affected", ctx)
+	}
+	if len(ctx.Facts) != 1 || ctx.Facts[0].Type != factSelectedBackend || len(ctx.Facts[0].RelatedIssues) != 1 {
+		t.Fatalf("facts = %+v, want selected backend related issue", ctx.Facts)
+	}
+	if got := ctx.Facts[0].RelatedIssues[0].Ref; got.Kind != "Deployment" || got.Name != "api" {
+		t.Fatalf("related issue ref = %+v, want Deployment/api", got)
+	}
+}
+
+func TestCompose_DiagnosticContextServiceAffectedByBackendIssuesFlatMode(t *testing.T) {
+	p := &fakeProvider{
+		problems: []k8s.Detection{
+			{Kind: "Service", Namespace: "prod", Name: "api", Severity: "critical", Reason: "0/1 selected pods ready"},
+			{Kind: "Pod", Namespace: "prod", Name: "api-abc", Severity: "critical", Reason: "CrashLoopBackOff", OwnerKind: "Deployment", OwnerName: "api"},
+		},
+		selectedPods: map[string][]Ref{
+			"prod/api": {{Kind: "Pod", Namespace: "prod", Name: "api-abc"}},
+		},
+	}
+
+	out := Compose(p, Filters{})
+	var svc Issue
+	for _, issue := range out {
+		if issue.Kind == "Service" && issue.Name == "api" {
+			svc = issue
+		}
+	}
+	if svc.Kind == "" {
+		t.Fatalf("service issue not found: %+v", out)
+	}
+	ctx := svc.DiagnosticContext
+	if ctx == nil || len(ctx.Facts) != 1 || len(ctx.Facts[0].RelatedIssues) != 1 {
+		t.Fatalf("diagnostic context = %+v, want selected backend related issue", ctx)
+	}
+	if got := ctx.Facts[0].RelatedIssues[0].Ref; got.Kind != "Pod" || got.Name != "api-abc" {
+		t.Fatalf("related issue ref = %+v, want flat Pod/api-abc", got)
+	}
+}
+
+func TestCompose_DiagnosticContextServiceConfigCandidate(t *testing.T) {
+	p := &fakeProvider{
+		problems: []k8s.Detection{
+			{Kind: "Service", Namespace: "prod", Name: "api", Severity: "warning", Reason: "Selector matches no pods"},
+		},
+	}
+
+	out := Compose(p, Filters{})
+	if len(out) != 1 {
+		t.Fatalf("got %d issues, want 1: %+v", len(out), out)
+	}
+	ctx := out[0].DiagnosticContext
+	if ctx == nil || ctx.Role != issuesapi.DiagnosticRoleCandidate {
+		t.Fatalf("diagnostic context = %+v, want candidate", ctx)
+	}
+	if len(ctx.Facts) != 1 || ctx.Facts[0].Type != factServiceConfig {
+		t.Fatalf("facts = %+v, want service_config_mismatch", ctx.Facts)
+	}
+}
+
+func TestCompose_DiagnosticContextServiceEnvCandidate(t *testing.T) {
+	cases := []struct {
+		name    string
+		reason  string
+		message string
+	}{
+		{
+			name:    "port mismatch",
+			reason:  "Service port mismatch",
+			message: "CHECKOUT_ADDR points at cart:8080, but cart exposes 80",
+		},
+		{
+			name:    "missing service",
+			reason:  "Missing referenced Service",
+			message: "AD_SERVICE_ADDR points at missing Service ad:8080",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := &fakeProvider{
+				problems: []k8s.Detection{
+					{Kind: "Deployment", Namespace: "prod", Name: "checkout", Severity: "critical", Reason: tc.reason, Message: tc.message},
+				},
+			}
+
+			out := Compose(p, Filters{})
+			if len(out) != 1 {
+				t.Fatalf("got %d issues, want 1: %+v", len(out), out)
+			}
+			ctx := out[0].DiagnosticContext
+			if ctx == nil || ctx.Role != issuesapi.DiagnosticRoleCandidate {
+				t.Fatalf("diagnostic context = %+v, want candidate", ctx)
+			}
+			if len(ctx.Facts) != 1 || ctx.Facts[0].Type != factServiceEnvReference || ctx.Facts[0].Message == "" {
+				t.Fatalf("facts = %+v, want service_env_reference with message", ctx.Facts)
+			}
+		})
+	}
+}
+
+func TestCompose_DiagnosticContextProbeAndInitCandidates(t *testing.T) {
+	p := &fakeProvider{
+		problems: []k8s.Detection{
+			{Kind: "Pod", Namespace: "prod", Name: "probe", Severity: "critical", Reason: "ReadinessProbeInvalid", Message: "readiness probe references named port \"http\""},
+			{Kind: "Pod", Namespace: "prod", Name: "init", Severity: "high", Reason: "InitContainerStalled", Message: "init container \"wait\" has been running for 10m"},
+		},
+	}
+
+	out := Compose(p, Filters{})
+	byName := map[string]Issue{}
+	for _, issue := range out {
+		byName[issue.Name] = issue
+	}
+	probeCtx := byName["probe"].DiagnosticContext
+	if probeCtx == nil || probeCtx.Role != issuesapi.DiagnosticRoleCandidate || len(probeCtx.Facts) != 1 || probeCtx.Facts[0].Type != factProbeTarget {
+		t.Fatalf("probe diagnostic context = %+v, want probe target candidate", probeCtx)
+	}
+	initCtx := byName["init"].DiagnosticContext
+	if initCtx == nil || initCtx.Role != issuesapi.DiagnosticRoleCandidate || len(initCtx.Facts) != 1 || initCtx.Facts[0].Type != factBlockedInit {
+		t.Fatalf("init diagnostic context = %+v, want blocked init candidate", initCtx)
+	}
+}
+
+func TestCompose_DiagnosticContextRestartCauseFact(t *testing.T) {
+	p := &fakeProvider{
+		problems: []k8s.Detection{
+			{
+				Kind:                 "Pod",
+				Namespace:            "prod",
+				Name:                 "frontend-abc",
+				Severity:             "critical",
+				Reason:               "LivenessProbeFailed",
+				RestartCount:         4,
+				LastTerminatedReason: "Error",
+			},
+		},
+	}
+
+	out := Compose(p, Filters{})
+	if len(out) != 1 {
+		t.Fatalf("got %d issues, want 1: %+v", len(out), out)
+	}
+	ctx := out[0].DiagnosticContext
+	if ctx == nil {
+		t.Fatalf("diagnostic context missing")
+	}
+	var saw bool
+	for _, fact := range ctx.Facts {
+		if fact.Type == factRestartCause && strings.Contains(fact.Message, "restartCount=4") && strings.Contains(fact.Message, "probeFailure=LivenessProbeFailed") {
+			saw = true
+		}
+	}
+	if !saw {
+		t.Fatalf("facts = %+v, want restart_cause evidence", ctx.Facts)
+	}
+}
+
+func TestCompose_AttachesPositiveChangeContext(t *testing.T) {
+	p := &fakeProvider{
+		problems: []k8s.Detection{
+			{Kind: "Deployment", Group: "apps", Namespace: "prod", Name: "checkout", Severity: "critical", Reason: "Deployment unavailable"},
+			{Kind: "Deployment", Group: "apps", Namespace: "prod", Name: "cart", Severity: "critical", Reason: "Deployment unavailable"},
+		},
+		change: map[string]*issuesapi.ChangeContext{
+			resourceKey("apps", "Deployment", "prod", "checkout"): {
+				Changed:  true,
+				What:     "pod_template",
+				When:     "2m",
+				Evidence: "generation=3, 2 owned ReplicaSets",
+			},
+		},
+	}
+
+	out := Compose(p, Filters{})
+	byName := map[string]Issue{}
+	for _, issue := range out {
+		byName[issue.Name] = issue
+	}
+	if ctx := byName["checkout"].ChangeContext; ctx == nil || !ctx.Changed || ctx.What != "pod_template" || ctx.Evidence == "" {
+		t.Fatalf("checkout change context = %+v, want positive pod_template evidence", ctx)
+	}
+	if ctx := byName["cart"].ChangeContext; ctx != nil {
+		t.Fatalf("cart change context = %+v, want nil when provider has no positive evidence", ctx)
+	}
+}
+
+func TestDeploymentChangeContextUsesReplicaSetHistory(t *testing.T) {
+	defer k8s.ResetTestState()
+
+	trueVal := true
+	deploy := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "checkout",
+			Namespace:  "prod",
+			UID:        "deploy-uid",
+			Generation: 3,
+		},
+		Status: appsv1.DeploymentStatus{ObservedGeneration: 3},
+	}
+	oldRS := &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "checkout-old",
+			Namespace:         "prod",
+			CreationTimestamp: metav1.NewTime(time.Now().Add(-20 * time.Minute)),
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1",
+				Kind:       "Deployment",
+				Name:       "checkout",
+				UID:        "deploy-uid",
+				Controller: &trueVal,
+			}},
+		},
+	}
+	newRS := &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "checkout-new",
+			Namespace:         "prod",
+			CreationTimestamp: metav1.NewTime(time.Now().Add(-2 * time.Minute)),
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1",
+				Kind:       "Deployment",
+				Name:       "checkout",
+				UID:        "deploy-uid",
+				Controller: &trueVal,
+			}},
+		},
+	}
+	if err := k8s.InitTestResourceCache(fake.NewClientset(
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "prod"}},
+		deploy,
+		oldRS,
+		newRS,
+	)); err != nil {
+		t.Fatalf("InitTestResourceCache: %v", err)
+	}
+
+	ctx := deploymentChangeContext(k8s.GetResourceCache(), "prod", "checkout")
+	if ctx == nil || !ctx.Changed || ctx.What != "pod_template" || !strings.Contains(ctx.Evidence, "2 owned ReplicaSets") || !strings.Contains(ctx.Evidence, "checkout-new") {
+		t.Fatalf("deployment change context = %+v, want newest ReplicaSet evidence", ctx)
+	}
+}
+
+func TestClusterDNSContextRequiresTriggerSignal(t *testing.T) {
+	defer k8s.ResetTestState()
+
+	client := fake.NewClientset(
+		&corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: "coredns", Namespace: "kube-system"},
+			Data: map[string]string{
+				"Corefile": ".:53 {\n  template ANY svc.cluster.local {\n    rcode NXDOMAIN\n  }\n}\n",
+			},
+		},
+	)
+	if err := k8s.InitTestResourceCache(client); err != nil {
+		t.Fatalf("InitTestResourceCache: %v", err)
+	}
+	provider := &CacheProvider{cache: k8s.GetResourceCache()}
+
+	if got := provider.ClusterContextForIssues([]string{"prod"}, nil); got != nil {
+		t.Fatalf("static suspicious CoreDNS config should not produce cluster context without symptoms/change evidence: %+v", got)
+	}
+}
+
+func TestClusterDNSContextScansAllNamespacesForSymptoms(t *testing.T) {
+	defer k8s.ResetTestState()
+
+	client := fake.NewClientset(
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "prod"}},
+		&corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: "coredns", Namespace: "kube-system"},
+			Data: map[string]string{
+				"Corefile": ".:53 {\n  template ANY svc.cluster.local {\n    rcode NXDOMAIN\n  }\n}\n",
+			},
+		},
+		&corev1.Event{
+			ObjectMeta: metav1.ObjectMeta{Name: "dns-failure", Namespace: "prod"},
+			Type:       corev1.EventTypeWarning,
+			Reason:     "Failed",
+			Message:    "lookup checkout.prod.svc.cluster.local: no such host",
+		},
+	)
+	if err := k8s.InitTestResourceCache(client); err != nil {
+		t.Fatalf("InitTestResourceCache: %v", err)
+	}
+	provider := &CacheProvider{cache: k8s.GetResourceCache()}
+
+	got := provider.ClusterContextForIssues(nil, nil)
+	if got == nil || got.DNS == nil || len(got.DNS.Signals) == 0 {
+		t.Fatalf("cluster DNS context = %+v, want namespace DNS symptom signal", got)
+	}
+	if !strings.Contains(strings.Join(got.DNS.Signals, " "), "namespace prod") {
+		t.Fatalf("cluster DNS signals = %+v, want prod namespace symptom", got.DNS.Signals)
+	}
+}
+
+func TestClusterDNSContextFiresOnSuspiciousCoreDNSAndRecentRollout(t *testing.T) {
+	defer k8s.ResetTestState()
+
+	trueVal := true
+	deploy := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "coredns",
+			Namespace:  "kube-system",
+			UID:        "coredns-uid",
+			Generation: 3,
+			Labels:     map[string]string{"k8s-app": "kube-dns"},
+		},
+		Status: appsv1.DeploymentStatus{ObservedGeneration: 3},
+	}
+	oldRS := &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "coredns-old",
+			Namespace:         "kube-system",
+			CreationTimestamp: metav1.NewTime(time.Now().Add(-20 * time.Minute)),
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1",
+				Kind:       "Deployment",
+				Name:       "coredns",
+				UID:        "coredns-uid",
+				Controller: &trueVal,
+			}},
+		},
+	}
+	newRS := &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "coredns-new",
+			Namespace:         "kube-system",
+			CreationTimestamp: metav1.NewTime(time.Now().Add(-2 * time.Minute)),
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1",
+				Kind:       "Deployment",
+				Name:       "coredns",
+				UID:        "coredns-uid",
+				Controller: &trueVal,
+			}},
+		},
+	}
+	client := fake.NewClientset(
+		&corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: "coredns", Namespace: "kube-system"},
+			Data: map[string]string{
+				"Corefile": ".:53 {\n  template ANY svc.cluster.local {\n    rcode NXDOMAIN\n  }\n}\n",
+			},
+		},
+		deploy,
+		oldRS,
+		newRS,
+	)
+	if err := k8s.InitTestResourceCache(client); err != nil {
+		t.Fatalf("InitTestResourceCache: %v", err)
+	}
+	provider := &CacheProvider{cache: k8s.GetResourceCache()}
+
+	got := provider.ClusterContextForIssues([]string{"prod"}, nil)
+	if got == nil || got.DNS == nil || len(got.DNS.Findings) != 1 || len(got.DNS.Signals) == 0 {
+		t.Fatalf("cluster DNS context = %+v, want DNS finding with rollout signal", got)
+	}
+	if !strings.Contains(got.DNS.Signals[0], "CoreDNS Deployment") || !strings.Contains(got.DNS.Hint, "CoreDNS NXDOMAIN override") {
+		t.Fatalf("cluster DNS context = %+v, want directive CoreDNS rollout hint", got.DNS)
+	}
+
+	// A caller that can't read kube-system CoreDNS sources must not learn its
+	// suspicious state via the cluster-context side channel.
+	if denied := provider.ClusterContextForIssues([]string{"prod"}, func(string, string) bool { return false }); denied != nil {
+		t.Fatalf("cluster DNS context must be suppressed when caller can't read CoreDNS: %+v", denied)
+	}
+
+	configMapOnly := provider.ClusterContextForIssues([]string{"prod"}, func(group, resource string) bool {
+		return group == "" && resource == "configmaps"
+	})
+	if configMapOnly != nil {
+		t.Fatalf("rollout-only DNS context must be suppressed without Deployment/ReplicaSet access: %+v", configMapOnly)
 	}
 }
 

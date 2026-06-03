@@ -20,11 +20,13 @@ type ClusterOnlyKindInfo struct {
 var clusterOnlyKinds = map[string]ClusterOnlyKindInfo{
 	"nodes":                           {"", "nodes"},
 	"node":                            {"", "nodes"},
+	"no":                              {"", "nodes"},
 	"persistentvolumes":               {"", "persistentvolumes"},
 	"persistentvolume":                {"", "persistentvolumes"},
 	"pv":                              {"", "persistentvolumes"},
 	"namespaces":                      {"", "namespaces"},
 	"namespace":                       {"", "namespaces"},
+	"ns":                              {"", "namespaces"},
 	"storageclasses":                  {"storage.k8s.io", "storageclasses"},
 	"storageclass":                    {"storage.k8s.io", "storageclasses"},
 	"sc":                              {"storage.k8s.io", "storageclasses"},
@@ -52,7 +54,7 @@ var clusterOnlyKinds = map[string]ClusterOnlyKindInfo{
 // at the K8s level but is exposed as a filtered list, so it returns false.
 func IsClusterOnlyKind(kind string) bool {
 	k := strings.ToLower(kind)
-	if k == "namespaces" || k == "namespace" {
+	if k == "namespaces" || k == "namespace" || k == "ns" {
 		return false
 	}
 	_, ok := clusterOnlyKinds[k]

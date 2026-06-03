@@ -21,6 +21,7 @@ import (
 	"github.com/skyhook-io/radar/internal/helm"
 	"github.com/skyhook-io/radar/internal/issues"
 	"github.com/skyhook-io/radar/internal/k8s"
+	"github.com/skyhook-io/radar/internal/resourcecontextrefs"
 	"github.com/skyhook-io/radar/internal/search"
 	"github.com/skyhook-io/radar/internal/summarycontext"
 	"github.com/skyhook-io/radar/internal/timeline"
@@ -44,8 +45,7 @@ func registerTools(server *mcp.Server) {
 		OpenWorldHint: boolPtr(false),
 	}
 	// writeTool reflects worst-case action across the tools that share it:
-	// apply_resource uses SSA with Force=true (rips ownership from other
-	// field managers); manage_node drains evict pods; manage_workload
+	// apply_resource can force SSA ownership; manage_node drains evict pods; manage_workload
 	// rollback/restart overwrites desired state or terminates pods;
 	// manage_gitops terminate/rollback aborts or overwrites; manage_cronjob
 	// suspend mutates schedule state (not additive).
@@ -62,7 +62,8 @@ func registerTools(server *mcp.Server) {
 			"events, and Helm release status so you can rank likely suspects before " +
 			"calling get_resource or logs. Routing: unknown broken thing -> issues; " +
 			"content/name search -> search; service routing/dependencies -> get_topology " +
-			"or get_neighborhood; inventory/counts/Helm/events overview -> get_dashboard.",
+			"or get_neighborhood; inventory/counts/Helm/events overview -> get_dashboard. " +
+			"Use namespace for app-local triage; omit it when the root may be cluster-scoped.",
 		Annotations: readOnly,
 	}, logToolCall("get_dashboard", handleGetDashboard))
 
@@ -82,7 +83,7 @@ func registerTools(server *mcp.Server) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "list_resources",
 		Description: "Use for a jq-like namespace sweep when you know the resource kind " +
-			"(pods, deployments, services, configmaps, CRDs). Returns compact Kubernetes-shaped " +
+			"(pods/po, deployments/deploy, services/svc, configmaps/cm, CRDs). Returns compact Kubernetes-shaped " +
 			"rows plus summaryContext by default (managedBy, health, issueCount) so you can " +
 			"compare many similar resources and pick suspects before calling get_resource. " +
 			"For unknown kind/name searches, use search. For broad health triage, use " +
@@ -193,7 +194,8 @@ func registerTools(server *mcp.Server) {
 			"creates, updates, and deletes such as image changes, ConfigMap edits, scale " +
 			"events, label edits, and rollout churn. This is often faster than reading " +
 			"ReplicaSet histories or individual audit/log streams. Pair with since to " +
-			"bound the window; filter by namespace, kind, or name when you know the scope.",
+			"bound the window; filter by namespace, kind, or name when you know the scope. " +
+			"Omit namespace when the relevant change may be outside the app namespace.",
 		Annotations: readOnly,
 	}, logToolCall("get_changes", handleGetChanges))
 
@@ -286,7 +288,10 @@ func registerTools(server *mcp.Server) {
 			".status.conditions on CRDs from Argo/Flux/Knative/Crossplane/cert-manager/KEDA. " +
 			"Severity normalized to critical/warning. This is one curated stream — there is " +
 			"no source filter; each row carries a `source` label (problem|missing_ref|" +
-			"scheduling|condition) you can slice on via the CEL filter= if needed. " +
+			"scheduling|condition) you can slice on via the CEL filter= if needed. Some " +
+			"rows include `diagnostic_context`: deterministic facts such as explicit " +
+			"missing refs, selected backend issues, or workload rollups; treat these as " +
+			"triage context, not proof of root cause. " +
 			"For raw Kubernetes Warning events use get_events; for static best-practice / " +
 			"security-posture findings (runAsRoot, missing PDB, no probes, missing resource " +
 			"limits) use get_cluster_audit — a separate axis that must never be conflated (a " +
@@ -297,7 +302,8 @@ func registerTools(server *mcp.Server) {
 			"is a workload (Pod/Deployment/StatefulSet/DaemonSet) — it bundles spec + " +
 			"logs + events + context in one call. For non-workload kinds, call " +
 			"get_resource. Use get_neighborhood when the failure likely crosses " +
-			"Services/workloads/Pods/dependencies.",
+			"Services/workloads/Pods/dependencies. Use namespace for app-local triage; " +
+			"omit it when the root may be cluster-scoped or outside the app namespace.",
 		Annotations: readOnly,
 	}, logToolCall("issues", handleIssuesTool))
 
@@ -319,8 +325,6 @@ func registerTools(server *mcp.Server) {
 			"plus warmed CRDs; cold CRDs need list_resources first.",
 		Annotations: readOnly,
 	}, logToolCall("search", handleSearch))
-
-	// --- Workload logs tool (read-only) ---
 
 	// --- RBAC reverse-lookup (read-only) ---
 
@@ -389,14 +393,35 @@ func registerTools(server *mcp.Server) {
 		Name: "apply_resource",
 		Description: "Create or update a Kubernetes resource from a YAML manifest. " +
 			"In 'apply' mode (default), performs a server-side apply with FieldManager=radar " +
-			"and Force=true — this can take field ownership from other managers (Helm, Flux, " +
-			"GitOps controllers, kubectl), so applies against Helm/Flux-owned objects will " +
-			"succeed but may conflict with the upstream reconciler on the next sync. " +
+			"and reports field ownership conflicts instead of taking ownership by default. " +
+			"Set force=true only when you intend to take field ownership from other managers " +
+			"(Helm, Flux, GitOps controllers, kubectl). " +
 			"In 'create' mode, performs a strict create that fails if the resource already exists. " +
 			"Supports multi-document YAML separated by '---'. " +
-			"Use dry_run to validate without persisting changes.",
+			"Use dry_run to validate without persisting changes and preview the server-side result. " +
+			"Multi-document failures return per-document status because earlier documents may already be applied. " +
+			"By default returns compact " +
+			"post-mutation state, submitted-vs-live spec differences, rollout/pod status " +
+			"for workloads, and current related issues; " +
+			"set verify=false only when you need a terse write result.",
 		Annotations: writeTool,
 	}, logToolCall("apply_resource", handleApplyResource))
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "patch_resource",
+		Description: "Patch one existing Kubernetes resource with JSON Patch, JSON Merge Patch, or strategic merge patch. " +
+			"Use this for precise field/list mutations such as removing a bad dnsConfig, hostPort, " +
+			"initContainers field, sidecar container, nodeSelector, or replacing one scalar value. " +
+			"Prefer this over apply_resource when you know the exact field to mutate and do not want " +
+			"to rewrite the full manifest or take broad server-side-apply ownership. " +
+			"For patch_type=json, patch must be an RFC 6902 JSON Patch array. For patch_type=merge, " +
+			"patch must be a JSON object. For patch_type=strategic, use a JSON object against built-in " +
+			"Kubernetes kinds when you need name-keyed list merging, such as editing one container. " +
+			"By default returns compact post-patch state and " +
+			"dry-run preview diffs; JSON Patch calls also include per-operation field checks. Set " +
+			"verify=false only when you need a terse write result.",
+		Annotations: writeTool,
+	}, logToolCall("patch_resource", handlePatchResource))
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "manage_node",
@@ -424,7 +449,7 @@ type topResourcesInput struct {
 }
 
 type listResourcesInput struct {
-	Kind      string `json:"kind" jsonschema:"resource kind to list for a broad sweep, e.g. pods, deployments, services, configmaps. Prefer this before get_resource when comparing many same-kind objects."`
+	Kind      string `json:"kind" jsonschema:"resource kind to list for a broad sweep, e.g. pods/po, deployments/deploy, services/svc, configmaps/cm. Prefer this before get_resource when comparing many same-kind objects."`
 	Group     string `json:"group,omitempty" jsonschema:"API group when the kind is ambiguous (e.g. serving.knative.dev for Knative Service vs core Service)"`
 	Namespace string `json:"namespace,omitempty" jsonschema:"filter to a specific namespace for app-scoped triage"`
 	Context   string `json:"context,omitempty" jsonschema:"per-row context: default attaches summaryContext (managedBy + health + issueCount) for suspect ranking; 'none' returns bare rows"`
@@ -933,6 +958,7 @@ func buildMCPResourceContext(ctx context.Context, obj runtime.Object, kind, name
 		AccessChecker:   newMCPRequestScopedChecker(ctx),
 		IssueSummary:    issueSum,
 		AuditSummary:    auditSum,
+		AppReferences:   resourcecontextrefs.AppReferencesFromEnvServiceChecks(k8s.FindEnvServiceRefChecksForObject(cache, obj)),
 		ServiceBackends: mcpServiceBackendLookup{cache: cache},
 	}
 
@@ -1917,10 +1943,8 @@ func buildDashboard(ctx context.Context, cache *k8s.ResourceCache, namespace str
 	now := time.Now()
 
 	// Collect all problems first (uncapped), sort by severity+age, then
-	// apply the dashboard cap. Previously each loop applied its own
-	// >=10 cap independently, which meant a critical missing-ref could
-	// be dropped in favour of a medium-severity workload problem that
-	// happened to be appended earlier in the sequence.
+	// apply the dashboard cap so higher-severity findings cannot be displaced
+	// by lower-severity findings appended earlier in the sequence.
 	var allProblems []mcpProblem
 
 	// Pod health
@@ -2438,12 +2462,21 @@ func handleIssuesTool(ctx context.Context, _ *mcp.CallToolRequest, input issuesI
 	// Shared response shape (issues.ListResponse) — identical to /api/issues so
 	// HTTP and MCP can't drift.
 	resp := issues.NewListResponse(out, stats)
+	resp.ClusterContext = provider.ClusterContextForIssues(allowedNamespaces, func(group, resource string) bool {
+		return canReadInNamespace(ctx, group, resource, "kube-system", "list")
+	})
 	// Steering hint when the issue list was capped (MCP-only).
 	if stats.TotalMatched > len(out) {
 		resp.NarrowHint = fmt.Sprintf(
 			"returned %d of %d issues — narrow with namespace=, kind=, severity=critical, add filter= CEL, or raise limit (cap 1000)",
 			len(out), stats.TotalMatched,
 		)
+	}
+	if resp.ClusterContext != nil && resp.ClusterContext.DNS != nil && resp.ClusterContext.DNS.Hint != "" {
+		if resp.NarrowHint != "" {
+			resp.NarrowHint += "; "
+		}
+		resp.NarrowHint += resp.ClusterContext.DNS.Hint
 	}
 	if result := k8s.GetCachedPermissionResult(); result != nil {
 		if visibility := k8s.BuildVisibilitySummary(result, k8s.VisibilityNamespace(allowedNamespaces)); visibility != nil {

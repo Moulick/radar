@@ -253,12 +253,29 @@ export const MCP_TOOL_CATALOG: MCPToolInfo[] = [
   {
     name: 'apply_resource',
     write: true,
-    desc: 'Create or update a resource from YAML. apply mode is a server-side apply with Force=true (can take field ownership from Helm/Flux); create mode fails if it exists. Multi-document YAML supported.',
+    desc: 'Create or update a resource from YAML. apply mode is server-side apply and reports field ownership conflicts by default; create mode fails if it exists. Multi-document YAML returns per-document status on partial failure.',
     params: [
       { arg: 'yaml', required: true, desc: 'YAML manifest (multi-document with --- supported)' },
       { arg: 'mode', desc: 'apply (default) or create' },
-      { arg: 'dry_run', desc: 'validate without persisting' },
+      { arg: 'dry_run', desc: 'validate and preview without persisting' },
       { arg: 'namespace', desc: 'override namespace for the resource' },
+      { arg: 'verify', desc: 'return post-mutation state; on dry_run return preview diff (default true)' },
+      { arg: 'force', desc: 'force SSA field ownership conflicts and take ownership from other managers (default false)' },
+    ],
+  },
+  {
+    name: 'patch_resource',
+    write: true,
+    desc: 'Patch one existing resource with JSON Patch, JSON Merge Patch, or built-in-kind strategic merge patch for precise edits without rewriting the full manifest.',
+    params: [
+      { arg: 'kind', required: true, desc: 'resource kind, e.g. Deployment, Service, ConfigMap' },
+      { arg: 'name', required: true, desc: 'resource name' },
+      { arg: 'namespace', desc: 'resource namespace; omit for cluster-scoped resources' },
+      { arg: 'group', desc: 'API group when the kind is ambiguous' },
+      { arg: 'patch_type', desc: 'json (default), merge, or strategic' },
+      { arg: 'patch', required: true, desc: 'JSON patch body' },
+      { arg: 'dry_run', desc: 'validate and preview without persisting' },
+      { arg: 'verify', desc: 'return post-patch state; on dry_run return preview diff (default true)' },
     ],
   },
   {

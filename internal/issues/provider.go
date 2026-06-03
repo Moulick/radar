@@ -1,11 +1,33 @@
 package issues
 
 import (
+	"context"
+	"fmt"
+	"sort"
+	"strings"
+	"time"
+
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	"github.com/skyhook-io/radar/internal/k8s"
+	"github.com/skyhook-io/radar/internal/timeline"
+	"github.com/skyhook-io/radar/pkg/issuesapi"
 )
+
+const (
+	clusterDNSContextRecentWindow = 30 * time.Minute
+	maxDNSNamespaceSymptomScans   = 50
+)
+
+type coreDNSAccess struct {
+	configMaps  bool
+	deployments bool
+	replicaSets bool
+}
 
 // CacheProvider adapts radar's in-process caches to the Provider
 // interface. Uses the package-level singletons (k8s.GetResourceCache,
@@ -50,12 +72,14 @@ func (p *CacheProvider) DetectMissingRefs(namespaces []string) []k8s.Detection {
 		out := k8s.DetectMissingRefs(p.cache, "")
 		out = append(out, k8s.DetectMissingWebhookRefs(p.cache, p.dynamic, p.discovery, "")...)
 		out = append(out, k8s.DetectMissingGatewayRefs(p.cache, p.dynamic, p.discovery, "")...)
+		out = append(out, k8s.DetectMissingCRDRefs(p.cache, p.dynamic, p.discovery, "")...)
 		return out
 	}
 	perNs := make([][]k8s.Detection, 0, len(namespaces))
 	for _, ns := range namespaces {
 		out := k8s.DetectMissingRefs(p.cache, ns)
 		out = append(out, k8s.DetectMissingGatewayRefs(p.cache, p.dynamic, p.discovery, ns)...)
+		out = append(out, k8s.DetectMissingCRDRefs(p.cache, p.dynamic, p.discovery, ns)...)
 		perNs = append(perNs, out)
 	}
 	// Webhook configs are cluster-scoped — namespace-bounded callers do
@@ -109,6 +133,329 @@ func (p *CacheProvider) DetectGitOpsProblems(namespaces []string) []k8s.Detectio
 		perNs = append(perNs, k8s.DetectGitOpsProblems(p.dynamic, p.discovery, ns))
 	}
 	return flattenNamespacedProblems(perNs)
+}
+
+func (p *CacheProvider) SelectedPodsForService(namespace, name string) []Ref {
+	if p == nil || p.cache == nil || p.cache.Services() == nil || p.cache.Pods() == nil {
+		return nil
+	}
+	svc, err := p.cache.Services().Services(namespace).Get(name)
+	if err != nil || svc == nil || len(svc.Spec.Selector) == 0 {
+		return nil
+	}
+	pods, err := p.cache.Pods().Pods(namespace).List(labels.SelectorFromSet(labels.Set(svc.Spec.Selector)))
+	if err != nil {
+		return nil
+	}
+	refs := make([]Ref, 0, len(pods))
+	for _, pod := range pods {
+		refs = append(refs, Ref{Kind: "Pod", Namespace: pod.Namespace, Name: pod.Name})
+	}
+	sortRefs(refs)
+	return refs
+}
+
+func (p *CacheProvider) ChangeContextForIssue(i Issue) *issuesapi.ChangeContext {
+	if p == nil || p.cache == nil {
+		return nil
+	}
+	if i.Kind != "Deployment" || (i.Group != "" && i.Group != "apps") || i.Namespace == "" || i.Name == "" {
+		return nil
+	}
+	return deploymentChangeContext(p.cache, i.Namespace, i.Name)
+}
+
+// ClusterContextForIssues surfaces cross-namespace cluster context (today: the
+// CoreDNS DNS hint) alongside a namespace-scoped issue query. canReadCoreDNS
+// gates kube-system disclosure by the concrete resource being read. A nil
+// predicate means no auth gate (local/no-auth), matching s.canRead /
+// canReadInNamespace passthrough semantics.
+func (p *CacheProvider) ClusterContextForIssues(namespaces []string, canReadCoreDNS func(group, resource string) bool) *issuesapi.ClusterContext {
+	access := coreDNSAccess{configMaps: true, deployments: true, replicaSets: true}
+	if canReadCoreDNS != nil {
+		access = coreDNSAccess{
+			configMaps:  canReadCoreDNS("", "configmaps"),
+			deployments: canReadCoreDNS("apps", "deployments"),
+			replicaSets: canReadCoreDNS("apps", "replicasets"),
+		}
+	}
+	if !access.configMaps {
+		return nil
+	}
+	dns := p.clusterDNSContext(namespaces, access)
+	if dns == nil {
+		return nil
+	}
+	return &issuesapi.ClusterContext{DNS: dns}
+}
+
+func (p *CacheProvider) clusterDNSContext(namespaces []string, access coreDNSAccess) *issuesapi.ClusterDNSContext {
+	if p == nil || p.cache == nil {
+		return nil
+	}
+	findings := k8s.DetectSuspiciousCoreDNS(p.cache, time.Now())
+	if len(findings) == 0 {
+		return nil
+	}
+	signals := p.clusterDNSSignals(namespaces, access)
+	if len(signals) == 0 {
+		return nil
+	}
+	out := &issuesapi.ClusterDNSContext{
+		Signals: signals,
+		Hint:    "Cluster DNS context may be relevant: inspect kube-system/CoreDNS before attributing DNS or service-resolution symptoms only to application workloads.",
+	}
+	for _, f := range findings {
+		out.Findings = append(out.Findings, issuesapi.ClusterDNSFinding{
+			Kind:      f.Kind,
+			Namespace: f.Namespace,
+			Name:      f.Name,
+			Severity:  f.Severity,
+			Reason:    f.Reason,
+			Message:   f.Message,
+			Evidence:  strings.Join(signals, "; "),
+		})
+		if len(out.Findings) >= 3 {
+			break
+		}
+	}
+	if len(out.Findings) > 0 {
+		first := out.Findings[0]
+		out.Hint = fmt.Sprintf("%s %s/%s is suspicious (%s); %s", first.Kind, first.Namespace, first.Name, first.Reason, out.Hint)
+	}
+	return out
+}
+
+func (p *CacheProvider) clusterDNSSignals(namespaces []string, access coreDNSAccess) []string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(s string) {
+		if s == "" || seen[s] || len(out) >= 6 {
+			return
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	if access.deployments && access.replicaSets {
+		add(p.coreDNSDeploymentRolloutSignal())
+	}
+	if access.configMaps {
+		add(observedCoreDNSConfigMapChangeSignal())
+	}
+	for _, s := range p.namespaceDNSSymptomSignals(namespaces) {
+		add(s)
+	}
+	return out
+}
+
+func (p *CacheProvider) coreDNSDeploymentRolloutSignal() string {
+	if p.cache == nil || p.cache.Deployments() == nil || p.cache.ReplicaSets() == nil {
+		return ""
+	}
+	deps, err := p.cache.Deployments().Deployments("kube-system").List(labels.Everything())
+	if err != nil {
+		return ""
+	}
+	for _, d := range deps {
+		if d == nil || !isCoreDNSNameOrLabels(d.Name, d.Labels) {
+			continue
+		}
+		if sig := deploymentRolloutSignal(p.cache, d, clusterDNSContextRecentWindow); sig != "" {
+			return sig
+		}
+	}
+	return ""
+}
+
+func (p *CacheProvider) namespaceDNSSymptomSignals(namespaces []string) []string {
+	if p == nil || p.cache == nil || p.cache.Events() == nil {
+		return nil
+	}
+	if len(namespaces) == 0 {
+		namespaces = p.namespacesForDNSSymptomScan()
+	}
+	var out []string
+	checkNamespace := func(ns string) {
+		events, err := p.cache.Events().Events(ns).List(labels.Everything())
+		if err != nil {
+			return
+		}
+		for _, e := range events {
+			if e == nil || e.Type != corev1.EventTypeWarning {
+				continue
+			}
+			if textContainsDNSSymptom(e.Reason + " " + e.Message) {
+				out = append(out, fmt.Sprintf("Warning events in namespace %s contain DNS resolution errors", ns))
+				return
+			}
+		}
+	}
+	for _, ns := range namespaces {
+		if ns != "" {
+			checkNamespace(ns)
+		}
+		if len(out) >= 3 {
+			break
+		}
+	}
+	return out
+}
+
+func (p *CacheProvider) namespacesForDNSSymptomScan() []string {
+	if p == nil || p.cache == nil || p.cache.Namespaces() == nil {
+		return nil
+	}
+	items, err := p.cache.Namespaces().List(labels.Everything())
+	if err != nil {
+		return nil
+	}
+	names := make([]string, 0, len(items))
+	for _, ns := range items {
+		if ns == nil || !dnsSymptomNamespace(ns.Name) {
+			continue
+		}
+		names = append(names, ns.Name)
+	}
+	sort.Strings(names)
+	if len(names) > maxDNSNamespaceSymptomScans {
+		names = names[:maxDNSNamespaceSymptomScans]
+	}
+	return names
+}
+
+func dnsSymptomNamespace(namespace string) bool {
+	switch namespace {
+	case "", "kube-system", "kube-public", "kube-node-lease":
+		return false
+	default:
+		return true
+	}
+}
+
+func observedCoreDNSConfigMapChangeSignal() string {
+	store := timeline.GetStore()
+	if store == nil {
+		return ""
+	}
+	events, err := store.Query(context.Background(), timeline.QueryOptions{
+		Namespaces: []string{"kube-system"},
+		Kinds:      []string{"ConfigMap"},
+		Since:      time.Now().Add(-clusterDNSContextRecentWindow),
+		Limit:      20,
+	})
+	if err != nil {
+		return ""
+	}
+	for _, e := range events {
+		if e.EventType != timeline.EventTypeUpdate || !strings.Contains(strings.ToLower(e.Name), "coredns") {
+			continue
+		}
+		return fmt.Sprintf("Radar observed ConfigMap kube-system/%s update %s ago", e.Name, k8s.FormatAge(time.Since(e.Timestamp)))
+	}
+	return ""
+}
+
+func deploymentChangeContext(cache *k8s.ResourceCache, namespace, name string) *issuesapi.ChangeContext {
+	if cache == nil || cache.Deployments() == nil || cache.ReplicaSets() == nil {
+		return nil
+	}
+	d, err := cache.Deployments().Deployments(namespace).Get(name)
+	if err != nil || d == nil || d.Generation <= 1 {
+		return nil
+	}
+	rss, err := cache.ReplicaSets().ReplicaSets(namespace).List(labels.Everything())
+	if err != nil {
+		return nil
+	}
+	owned := ownedReplicaSets(d, rss)
+	if len(owned) < 2 {
+		return nil
+	}
+	sort.SliceStable(owned, func(i, j int) bool {
+		return owned[i].CreationTimestamp.Time.After(owned[j].CreationTimestamp.Time)
+	})
+	newest := owned[0]
+	parts := []string{
+		fmt.Sprintf("generation=%d", d.Generation),
+		fmt.Sprintf("observedGeneration=%d", d.Status.ObservedGeneration),
+		fmt.Sprintf("%d owned ReplicaSets", len(owned)),
+	}
+	if !newest.CreationTimestamp.IsZero() {
+		parts = append(parts, fmt.Sprintf("newest ReplicaSet %s created %s ago", newest.Name, k8s.FormatAge(time.Since(newest.CreationTimestamp.Time))))
+	}
+	ctx := &issuesapi.ChangeContext{
+		Changed:  true,
+		What:     "pod_template",
+		Evidence: strings.Join(parts, ", "),
+	}
+	if !newest.CreationTimestamp.IsZero() {
+		ctx.When = k8s.FormatAge(time.Since(newest.CreationTimestamp.Time))
+	}
+	return ctx
+}
+
+func deploymentRolloutSignal(cache *k8s.ResourceCache, d *appsv1.Deployment, window time.Duration) string {
+	if cache == nil || d == nil || d.Generation <= 1 || cache.ReplicaSets() == nil {
+		return ""
+	}
+	rss, err := cache.ReplicaSets().ReplicaSets(d.Namespace).List(labels.Everything())
+	if err != nil {
+		return ""
+	}
+	owned := ownedReplicaSets(d, rss)
+	if len(owned) < 2 {
+		return ""
+	}
+	sort.SliceStable(owned, func(i, j int) bool {
+		return owned[i].CreationTimestamp.Time.After(owned[j].CreationTimestamp.Time)
+	})
+	newest := owned[0]
+	if newest.CreationTimestamp.IsZero() || time.Since(newest.CreationTimestamp.Time) > window {
+		return ""
+	}
+	return fmt.Sprintf("CoreDNS Deployment kube-system/%s rolled %s ago (generation=%d, %d owned ReplicaSets, newest=%s)", d.Name, k8s.FormatAge(time.Since(newest.CreationTimestamp.Time)), d.Generation, len(owned), newest.Name)
+}
+
+func ownedReplicaSets(d *appsv1.Deployment, rss []*appsv1.ReplicaSet) []*appsv1.ReplicaSet {
+	if d == nil || d.UID == "" {
+		return nil
+	}
+	var out []*appsv1.ReplicaSet
+	for _, rs := range rss {
+		if rs == nil {
+			continue
+		}
+		for _, owner := range rs.OwnerReferences {
+			if owner.Controller != nil && *owner.Controller && owner.Kind == "Deployment" && owner.UID == d.UID {
+				out = append(out, rs)
+				break
+			}
+		}
+	}
+	return out
+}
+
+func isCoreDNSNameOrLabels(name string, labels map[string]string) bool {
+	low := strings.ToLower(name)
+	if strings.Contains(low, "coredns") || strings.Contains(low, "kube-dns") {
+		return true
+	}
+	for _, key := range []string{"k8s-app", "app", "app.kubernetes.io/name"} {
+		if strings.Contains(strings.ToLower(labels[key]), "coredns") || strings.Contains(strings.ToLower(labels[key]), "kube-dns") {
+			return true
+		}
+	}
+	return false
+}
+
+func textContainsDNSSymptom(text string) bool {
+	low := strings.ToLower(text)
+	return strings.Contains(low, "no such host") ||
+		strings.Contains(low, "nxdomain") ||
+		strings.Contains(low, "temporary failure in name resolution") ||
+		strings.Contains(low, "name or service not known") ||
+		strings.Contains(low, "server misbehaving") ||
+		strings.Contains(low, "lookup ") && strings.Contains(low, ".svc")
 }
 
 // flattenNamespacedProblems concatenates per-namespace problem lists

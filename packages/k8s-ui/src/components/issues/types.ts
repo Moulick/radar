@@ -57,6 +57,34 @@ export interface IssueAffected {
   nodes?: number;
 }
 
+export type IssueDiagnosticRole = 'candidate' | 'affected' | 'rollup' | 'context';
+
+export interface IssueDiagnosticIssueRef {
+  ref: IssueResourceRef;
+  reason?: string;
+  category?: string;
+  severity?: IssueSeverity;
+}
+
+export interface IssueDiagnosticFact {
+  type: string;
+  message?: string;
+  refs?: IssueResourceRef[];
+  related_issues?: IssueDiagnosticIssueRef[];
+}
+
+export interface IssueDiagnosticContext {
+  role?: IssueDiagnosticRole;
+  facts?: IssueDiagnosticFact[];
+}
+
+export interface IssueChangeContext {
+  changed: boolean;
+  what?: string;
+  when?: string;
+  evidence?: string;
+}
+
 /**
  * A grouped live issue — one row of the triage queue. Subject (kind/group/
  * namespace/name) is the topmost owner when the rows folded under a workload,
@@ -98,8 +126,11 @@ export interface Issue {
   count?: number;
 
   affected?: IssueAffected;
+  owner?: IssueResourceRef;
   members?: IssueResourceRef[];
   members_truncated?: boolean;
+  diagnostic_context?: IssueDiagnosticContext;
+  change_context?: IssueChangeContext;
 
   // Pod crash context carried from the representative member.
   restart_count?: number;

@@ -35,6 +35,7 @@ type UpdateResourceOptions struct {
 	Namespace string
 	Name      string
 	YAML      string // YAML content to apply
+	Force     bool   // Force SSA field ownership conflicts (override Helm/Flux/Argo/kubectl)
 }
 
 // DeleteResourceOptions contains options for deleting a resource.
@@ -51,14 +52,16 @@ type ApplyResourceOptions struct {
 	Mode              string // "apply" (server-side apply, default) or "create" (strict create)
 	DryRun            bool   // Validate without persisting
 	NamespaceOverride string // If set, overrides the namespace in the YAML
+	Force             bool   // Force SSA field ownership conflicts
 }
 
 // ApplyResourceResult contains the result of a create/apply operation.
 type ApplyResourceResult struct {
-	Name      string `json:"name"`
-	Namespace string `json:"namespace"`
-	Kind      string `json:"kind"`
-	Created   bool   `json:"created"` // true if newly created, false if updated
+	Name      string                     `json:"name"`
+	Namespace string                     `json:"namespace"`
+	Kind      string                     `json:"kind"`
+	Created   bool                       `json:"created"` // true if newly created, false if updated
+	Object    *unstructured.Unstructured `json:"-"`
 
 	// Warnings are advisory notes derived from the actual state of the cluster
 	// (e.g., "this resource is reconciled by Helm" or "field X you omitted is
@@ -152,7 +155,7 @@ func (m *WorkloadManager) UpdateResource(ctx context.Context, opts UpdateResourc
 	}
 	result, err := ri.Patch(ctx, opts.Name, types.ApplyPatchType, body, metav1.PatchOptions{
 		FieldManager: "radar",
-		Force:        boolPtr(true),
+		Force:        boolPtr(opts.Force),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to update resource: %w", err)
@@ -258,22 +261,25 @@ func (m *WorkloadManager) ApplyResource(ctx context.Context, opts ApplyResourceO
 	// resource is being newly created, and other errors shouldn't block the
 	// apply itself.
 	var pre *unstructured.Unstructured
+	var preGetErr error
 	if !opts.DryRun {
 		got, getErr := client.Get(ctx, name, metav1.GetOptions{})
 		if getErr == nil {
 			pre = got
 		} else if !apierrors.IsNotFound(getErr) {
+			preGetErr = getErr
 			log.Printf("[k8s] apply_resource: pre-apply GET %s/%s/%s failed: %v", kind, ns, name, getErr)
 		}
 	}
 
 	if mode == "create" {
-		_, err := client.Create(ctx, obj, metav1.CreateOptions{DryRun: dryRun})
+		created, err := client.Create(ctx, obj, metav1.CreateOptions{DryRun: dryRun})
 		if err != nil {
 			return nil, fmt.Errorf("failed to create resource: %w", err)
 		}
 		result.Created = true
-		m.populateApplyWarnings(ctx, result, obj, pre, nil, ns, kind, name, opts.DryRun)
+		result.Object = created
+		m.populateApplyWarnings(ctx, result, obj, pre, created, ns, kind, name, opts.DryRun)
 		return result, nil
 	}
 
@@ -283,9 +289,9 @@ func (m *WorkloadManager) ApplyResource(ctx context.Context, opts ApplyResourceO
 		return nil, fmt.Errorf("failed to marshal resource: %w", err)
 	}
 
-	_, err = client.Patch(ctx, name, types.ApplyPatchType, objJSON, metav1.PatchOptions{
+	applied, err := client.Patch(ctx, name, types.ApplyPatchType, objJSON, metav1.PatchOptions{
 		FieldManager: "radar",
-		Force:        boolPtr(true),
+		Force:        boolPtr(opts.Force),
 		DryRun:       dryRun,
 	})
 	if err != nil {
@@ -296,6 +302,7 @@ func (m *WorkloadManager) ApplyResource(ctx context.Context, opts ApplyResourceO
 	// With server-side apply we can't easily distinguish, so we default to false (updated).
 	// The caller can check if the resource was newly created by other means if needed.
 	result.Created = false
+	result.Object = applied
 
 	// Post-apply GET feeds the state-derived warnings (run against what
 	// actually landed) and the field-removal diff. Fetch it for creates too,
@@ -307,9 +314,18 @@ func (m *WorkloadManager) ApplyResource(ctx context.Context, opts ApplyResourceO
 		got, getErr := client.Get(ctx, name, metav1.GetOptions{})
 		if getErr == nil {
 			post = got
+			result.Object = got
 		} else {
 			log.Printf("[k8s] apply_resource: post-apply GET %s/%s/%s failed: %v", kind, ns, name, getErr)
 		}
+	}
+
+	// A non-NotFound pre-apply GET error means the object likely existed but we
+	// couldn't read it, so field-retention can't be diffed (pre is nil). Tell the
+	// agent the verification was skipped rather than letting silence imply a clean
+	// apply — a partial manifest may have dropped fields without warning.
+	if !opts.DryRun && pre == nil && preGetErr != nil {
+		result.Warnings = append(result.Warnings, "Pre-apply GET failed; Radar could not compute field-retention warnings — a partial manifest may have silently dropped fields.")
 	}
 
 	m.populateApplyWarnings(ctx, result, obj, pre, post, ns, kind, name, opts.DryRun)
@@ -337,6 +353,8 @@ func (m *WorkloadManager) populateApplyWarnings(ctx context.Context, result *App
 
 	if pre != nil && post != nil {
 		result.Warnings = append(result.Warnings, checkFieldRemoval(submitted, pre, post)...)
+	} else if !dryRun && pre != nil && post == nil {
+		result.Warnings = append(result.Warnings, "Post-apply verification GET failed; Radar could not compute field-retention warnings from the live object.")
 	}
 	// The consumer-reload reminder only makes sense for a persisted edit — on a
 	// dry run nothing landed, so the "restart consumers" advice would be
